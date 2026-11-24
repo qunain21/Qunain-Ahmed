@@ -1,16 +1,17 @@
 import type { IncomingMessage, ServerResponse } from 'http';
-import { sendJson } from './_gemini.js';
 
 export default function handler(
   _req: IncomingMessage,
   res: ServerResponse,
 ): void {
-  sendJson(res, 200, {
-    ok: true,
-    configured: Boolean(
-      process.env.GEMINI_API_KEY &&
-        process.env.GEMINI_API_KEY.trim() !== '' &&
-        process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY',
-    ),
-  });
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.end(
+    JSON.stringify({
+      ok: true,
+      configured: Boolean(apiKey && apiKey !== 'MY_GEMINI_API_KEY'),
+    }),
+  );
 }

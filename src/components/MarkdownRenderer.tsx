@@ -1,4 +1,4 @@
-import { Fragment, useState } from 'react';
+import { Fragment, memo, useState } from 'react';
 import { Check, Copy } from 'lucide-react';
 
 interface CodeBlockProps {
@@ -216,7 +216,9 @@ interface MarkdownRendererProps {
   content: string;
 }
 
-export function MarkdownRenderer({ content }: MarkdownRendererProps) {
+export const MarkdownRenderer = memo(function MarkdownRenderer({
+  content,
+}: MarkdownRendererProps) {
   const parts: Array<{ type: 'text' | 'code'; value: string; lang?: string }> = [];
   const codeBlockRegex = /```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g;
   let lastIndex = 0;
@@ -249,4 +251,4 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
       )}
     </div>
   );
-}
+});

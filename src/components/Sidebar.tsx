@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import {
   Check,
   MessageSquare,
@@ -26,7 +26,7 @@ interface SidebarProps {
   onToggleTheme: () => void;
 }
 
-export function Sidebar({
+export const Sidebar = memo(function Sidebar({
   open,
   onClose,
   conversations,
@@ -294,4 +294,4 @@ export function Sidebar({
       </aside>
     </>
   );
-}
+});

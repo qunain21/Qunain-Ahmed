@@ -15,25 +15,32 @@ import {
   looksLikeRomanUrdu,
   matchInstantReply,
 } from '../src/lib/quickReplies.js';
-import { isValidTimeZone, parseDateTimeQuery } from '../src/lib/dateTimeHelper.js';
+import {
+  buildStructuredDateTime,
+  isValidTimeZone,
+  parseDateTimeQuery,
+} from '../src/lib/dateTimeHelper.js';
 import {
   fetchLiveWeatherData,
   fetchLiveWeatherReply,
   parseWeatherQuery,
+  preGroundLiveWeatherContext,
   resolveDateTimeToolData,
   resolveDynamicDateTimeReply,
 } from './_weather.js';
 
-// Load .env.local first, then .env without overriding runtime-injected secrets
-dotenv.config({ path: '.env.local' });
-dotenv.config({ path: '.env' });
+// Skip synchronous filesystem .env reads when runtime secrets are already injected (e.g. Vercel)
+if (!process.env.VERCEL && !process.env.GEMINI_API_KEY) {
+  dotenv.config({ path: '.env.local' });
+  dotenv.config({ path: '.env' });
+}
 
 const PRIMARY_MODEL = 'gemini-3.1-flash-lite';
 const FALLBACK_FREE_MODEL = 'gemini-4-hydrogen';
-const MAX_SERVER_RETRIES = 2;
-const MAX_AUTO_RETRY_DELAY_MS = 1000;
-const UPSTREAM_CONNECT_TIMEOUT_MS = 16000;
-const STREAM_IDLE_TIMEOUT_MS = 16000;
+const MAX_SERVER_RETRIES = 1;
+const MAX_AUTO_RETRY_DELAY_MS = 700;
+const UPSTREAM_CONNECT_TIMEOUT_MS = 14000;
+const STREAM_IDLE_TIMEOUT_MS = 14000;
 const MAX_BODY_BYTES = 6 * 1024 * 1024;
 
 interface IncomingImage {
@@ -109,9 +116,9 @@ const LIVE_TOOL_DECLARATIONS: FunctionDeclaration[] = [
   },
 ];
 
-function shouldEnableLiveTools(messages: ChatMessageInput[]): boolean {
+function hasWeatherIntent(messages: ChatMessageInput[]): boolean {
   const combined = messages.map((m) => m.text).join(' ').toLowerCase();
-  return /\b(date|time|today|tomorrow|yesterday|day|year|month|weather|forecast|temperature|temp|rain|mausam|mosam|humidity|wind|climate|umbrella|jacket|hotter|colder|warmer|cooler|timezone|karachi|lahore|islamabad|dubai|london|2024|2025|2026|outdated|real-time|realtime|live)\b/i.test(
+  return /\b(weather|forecast|temperature|temp|rain|mausam|mosam|humidity|wind|climate|umbrella|jacket|hotter|colder|warmer|cooler)\b/i.test(
     combined,
   );
 }
@@ -146,26 +153,23 @@ function buildSystemInstruction(
   latestText: string,
   hasImage: boolean,
   clientTimeZone?: string,
+  groundedWeatherFacts?: string,
 ): string {
   const tz = isValidTimeZone(clientTimeZone) ? clientTimeZone : 'UTC';
-  const todayStr = new Intl.DateTimeFormat('en-US', {
-    timeZone: tz,
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-  }).format(new Date());
+  const nowInfo = buildStructuredDateTime(tz);
+  const weatherSection = groundedWeatherFacts
+    ? ` LIVE VERIFIED WEATHER DATA: ${groundedWeatherFacts}`
+    : '';
   const dateContext =
-    `AUTHORITATIVE REAL-TIME DATE: Today is ${todayStr} (${tz}). ` +
-    `Never use outdated training-data dates or contradict this date. ` +
-    `Never invent weather conditions, temperatures, or dates; call get_current_date, get_current_time, or get_live_weather when live data is needed, and if a weather tool fails, clearly tell the user live weather data is unavailable. ` +
-    `Keep answers short and direct for simple questions.`;
-  const imageHint = hasImage ? ' Inspect the image carefully to answer or extract text.' : '';
+    `CURRENT DATE & TIME: ${nowInfo.date}, ${nowInfo.time} (${tz}). ` +
+    `Always use this live date/time (never outdated training dates) and never invent weather data.${weatherSection} ` +
+    `Keep simple answers concise and direct.`;
+  const imageHint = hasImage ? ' Inspect the image carefully to answer.' : '';
   if (isUrduScript(latestText)) {
     return `${dateContext} Reply concisely in Urdu script.${imageHint}`;
   }
   if (language === 'urdu' || looksLikeRomanUrdu(latestText)) {
-    return `${dateContext} Reply concisely in clear Roman Urdu (or Urdu if written in Urdu script).${imageHint}`;
+    return `${dateContext} Reply concisely in clear Roman Urdu.${imageHint}`;
   }
   return `${dateContext}${imageHint}`;
 }
@@ -242,12 +246,17 @@ function parseImagePart(image: unknown): Part | null {
   };
 }
 
+let cachedGeminiClient: { apiKey: string; client: GoogleGenAI } | null = null;
+
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
     throw new Error('GEMINI_API_KEY_MISSING');
   }
-  return new GoogleGenAI({
+  if (cachedGeminiClient && cachedGeminiClient.apiKey === apiKey) {
+    return cachedGeminiClient.client;
+  }
+  const client = new GoogleGenAI({
     apiKey,
     httpOptions: {
       headers: {
@@ -255,6 +264,8 @@ function getGeminiClient(): GoogleGenAI {
       },
     },
   });
+  cachedGeminiClient = { apiKey, client };
+  return client;
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -524,6 +535,7 @@ async function streamWithOptionalTools(
   systemInstruction: string,
   signal: AbortSignal,
   includeToolsConfig: boolean,
+  maxOutputTokens = 768,
 ) {
   const thinkingLevel =
     model === 'gemini-3.1-flash-lite' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW;
@@ -546,6 +558,8 @@ async function streamWithOptionalTools(
       config: {
         abortSignal: timeoutController.signal,
         thinkingConfig: { thinkingLevel },
+        temperature: 0.6,
+        maxOutputTokens,
         systemInstruction,
         ...(includeToolsConfig
           ? { tools: [{ functionDeclarations: LIVE_TOOL_DECLARATIONS }] }
@@ -583,6 +597,7 @@ async function openStreamWithFirstChunk(
   signal: AbortSignal,
   enableTools: boolean,
   clientTimeZone?: string,
+  maxOutputTokens = 768,
 ) {
   if (!enableTools) {
     return await streamWithOptionalTools(
@@ -592,6 +607,7 @@ async function openStreamWithFirstChunk(
       systemInstruction,
       signal,
       false,
+      maxOutputTokens,
     );
   }
 
@@ -717,6 +733,7 @@ async function createStreamWithSmartRetry(
   signal: AbortSignal,
   enableTools: boolean,
   clientTimeZone?: string,
+  maxOutputTokens = 768,
 ) {
   let activeModel = PRIMARY_MODEL;
   let useTools = enableTools;
@@ -737,6 +754,7 @@ async function createStreamWithSmartRetry(
         signal,
         useTools,
         clientTimeZone,
+        maxOutputTokens,
       );
     } catch (err) {
       lastError = err;
@@ -745,10 +763,11 @@ async function createStreamWithSmartRetry(
         throw err;
       }
 
-      if (
-        err instanceof Error &&
-        (err.message === 'UPSTREAM_TIMEOUT' || err.message === 'EMPTY_UPSTREAM_RESPONSE')
-      ) {
+      if (err instanceof Error && err.message === 'UPSTREAM_TIMEOUT') {
+        throw err;
+      }
+
+      if (err instanceof Error && err.message === 'EMPTY_UPSTREAM_RESPONSE') {
         if (attempt < MAX_SERVER_RETRIES) {
           if (useTools) {
             useTools = false;
@@ -1015,15 +1034,33 @@ export async function handleChatRequest(
     }
   });
 
+  const weatherIntent = hasWeatherIntent(sanitized);
+  const preGrounded = weatherIntent
+    ? await preGroundLiveWeatherContext(
+        sanitized.map((m) => m.text).join(' '),
+        clientTimeZone,
+      )
+    : { groundedFacts: '', cityCount: 0 };
+
   const systemInstruction = buildSystemInstruction(
     language,
     latestMessage.text,
     latestHasImage,
     clientTimeZone,
+    preGrounded.groundedFacts || undefined,
   );
   const startMs = Date.now();
 
-  const enableTools = shouldEnableLiveTools(sanitized);
+  // Only invoke Gemini FunctionDeclaration round-trips when weather is needed for an unrecognized city
+  const enableTools = weatherIntent && preGrounded.cityCount === 0;
+  const trimmedPrompt = latestMessage.text.trim();
+  const isDetailedRequest =
+    trimmedPrompt.length >= 120 ||
+    latestHasImage ||
+    /\b(code|function|typescript|javascript|python|react|essay|article|detailed|step\s+by\s+step|explain\s+in\s+detail|tutorial)\b/i.test(
+      trimmedPrompt,
+    );
+  const maxOutputTokens = isDetailedRequest ? 1152 : 512;
 
   try {
     const { iterator, firstText, model } = await createStreamWithSmartRetry(
@@ -1033,6 +1070,7 @@ export async function handleChatRequest(
       controller.signal,
       enableTools,
       clientTimeZone,
+      maxOutputTokens,
     );
 
     res.statusCode = 200;

@@ -64,7 +64,7 @@ function parseRetryAfterHeader(headerValue: string | null): number | undefined {
   return undefined;
 }
 
-const CLIENT_TIMEOUT_MS = 38000;
+const CLIENT_TIMEOUT_MS = 24000;
 
 export async function streamChatCompletion({
   messages,

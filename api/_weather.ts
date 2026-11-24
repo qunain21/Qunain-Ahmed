@@ -1,11 +1,14 @@
 import {
   buildStructuredDateTime,
+  extractMentionedKnownCities,
   findKnownCity,
   formatDateTimeReply,
   isValidTimeZone,
 } from '../src/lib/dateTimeHelper.js';
 
-const WEATHER_TIMEOUT_MS = 5000;
+const WEATHER_TIMEOUT_MS = 4000;
+const WEATHER_CACHE_TTL_MS = 3 * 60 * 1000;
+const weatherCache = new Map<string, { expiresAt: number; data: LiveWeatherData }>();
 
 interface GeoResult {
   name: string;
@@ -244,6 +247,12 @@ export async function fetchLiveWeatherData(options: {
     };
   }
 
+  const cacheKey = targetLocation.toLowerCase().trim();
+  const cached = weatherCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { ok: true, data: cached.data };
+  }
+
   try {
     const geo = await geocodeLocation(targetLocation);
     if (!geo) {
@@ -278,34 +287,45 @@ export async function fetchLiveWeatherData(options: {
     const locationLabel =
       geo.country && geo.country !== geo.name ? `${geo.name}, ${geo.country}` : geo.name;
 
+    const liveData: LiveWeatherData = {
+      location: locationLabel,
+      timeZone: tz,
+      date,
+      localTime,
+      condition: describeWmoWeatherCode(wx.current.weather_code, false),
+      conditionUrdu: describeWmoWeatherCode(wx.current.weather_code, true),
+      temperatureC: Math.round(wx.current.temperature_2m),
+      feelsLikeC:
+        typeof wx.current.apparent_temperature === 'number'
+          ? Math.round(wx.current.apparent_temperature)
+          : undefined,
+      highC:
+        typeof wx.daily?.temperature_2m_max?.[0] === 'number'
+          ? Math.round(wx.daily.temperature_2m_max[0])
+          : undefined,
+      lowC:
+        typeof wx.daily?.temperature_2m_min?.[0] === 'number'
+          ? Math.round(wx.daily.temperature_2m_min[0])
+          : undefined,
+      humidityPercent: wx.current.relative_humidity_2m,
+      windSpeedKmh:
+        typeof wx.current.wind_speed_10m === 'number'
+          ? Math.round(wx.current.wind_speed_10m)
+          : undefined,
+    };
+
+    if (weatherCache.size >= 100) {
+      const oldestKey = weatherCache.keys().next().value;
+      if (oldestKey) weatherCache.delete(oldestKey);
+    }
+    weatherCache.set(cacheKey, {
+      expiresAt: Date.now() + WEATHER_CACHE_TTL_MS,
+      data: liveData,
+    });
+
     return {
       ok: true,
-      data: {
-        location: locationLabel,
-        timeZone: tz,
-        date,
-        localTime,
-        condition: describeWmoWeatherCode(wx.current.weather_code, false),
-        conditionUrdu: describeWmoWeatherCode(wx.current.weather_code, true),
-        temperatureC: Math.round(wx.current.temperature_2m),
-        feelsLikeC:
-          typeof wx.current.apparent_temperature === 'number'
-            ? Math.round(wx.current.apparent_temperature)
-            : undefined,
-        highC:
-          typeof wx.daily?.temperature_2m_max?.[0] === 'number'
-            ? Math.round(wx.daily.temperature_2m_max[0])
-            : undefined,
-        lowC:
-          typeof wx.daily?.temperature_2m_min?.[0] === 'number'
-            ? Math.round(wx.daily.temperature_2m_min[0])
-            : undefined,
-        humidityPercent: wx.current.relative_humidity_2m,
-        windSpeedKmh:
-          typeof wx.current.wind_speed_10m === 'number'
-            ? Math.round(wx.current.wind_speed_10m)
-            : undefined,
-      },
+      data: liveData,
     };
   } catch {
     return {
@@ -314,6 +334,33 @@ export async function fetchLiveWeatherData(options: {
       error: `Unable to retrieve live weather data for "${targetLocation}" right now.`,
     };
   }
+}
+
+export async function preGroundLiveWeatherContext(
+  text: string,
+  clientTimeZone?: string,
+): Promise<{ groundedFacts: string; cityCount: number }> {
+  const cities = extractMentionedKnownCities(text, 3);
+  if (cities.length === 0) {
+    return { groundedFacts: '', cityCount: 0 };
+  }
+
+  const results = await Promise.all(
+    cities.map(async (city) => {
+      const res = await fetchLiveWeatherData({
+        locationQuery: city.name,
+        clientTimeZone,
+      });
+      return res.ok
+        ? `${res.data.location} (${res.data.date} ${res.data.localTime}): ${res.data.condition}, ${res.data.temperatureC}°C (feels like ${res.data.feelsLikeC ?? res.data.temperatureC}°C), high/low ${res.data.highC ?? '-'}°C/${res.data.lowC ?? '-'}°C, humidity ${res.data.humidityPercent ?? '-'}%, wind ${res.data.windSpeedKmh ?? '-'} km/h.`
+        : `${city.name}: live weather unavailable (${res.error}).`;
+    }),
+  );
+
+  return {
+    groundedFacts: results.join(' | '),
+    cityCount: cities.length,
+  };
 }
 
 export async function fetchLiveWeatherReply(options: {

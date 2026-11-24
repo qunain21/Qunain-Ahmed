@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { memo, useEffect, useRef } from 'react';
 import { AlertCircle, ArrowUp, ImagePlus, Loader2, RefreshCw, Square, X } from 'lucide-react';
 import { ChatImage } from '../types/chat';
 import { formatBytes } from '../lib/imageUtils';
@@ -17,7 +17,7 @@ interface ChatInputProps {
   onClearImageError: () => void;
 }
 
-export function ChatInput({
+export const ChatInput = memo(function ChatInput({
   value,
   onChange,
   onSubmit,
@@ -241,4 +241,4 @@ export function ChatInput({
       </p>
     </div>
   );
-}
+});

@@ -45,18 +45,25 @@ const STARTER_PROMPTS = [
   },
 ];
 
+function getInitialChatState(): {
+  conversations: Conversation[];
+  activeId: string | null;
+} {
+  const saved = loadConversations();
+  const savedActive = loadActiveConversationId();
+  const activeId =
+    savedActive && saved.some((c) => c.id === savedActive)
+      ? savedActive
+      : (saved[0]?.id ?? null);
+  return { conversations: saved, activeId };
+}
+
 export default function App() {
-  const [conversations, setConversations] = useState<Conversation[]>(() =>
-    loadConversations(),
+  const [initialState] = useState(getInitialChatState);
+  const [conversations, setConversations] = useState<Conversation[]>(
+    initialState.conversations,
   );
-  const [activeId, setActiveId] = useState<string | null>(() => {
-    const saved = loadConversations();
-    const savedActive = loadActiveConversationId();
-    if (savedActive && saved.some((c) => c.id === savedActive)) {
-      return savedActive;
-    }
-    return saved[0]?.id ?? null;
-  });
+  const [activeId, setActiveId] = useState<string | null>(initialState.activeId);
   const [theme, setTheme] = useState<ThemeMode>(() => loadTheme());
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [inputValue, setInputValue] = useState('');
@@ -71,6 +78,8 @@ export default function App() {
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const isSubmittingRef = useRef(false);
+  const inputValueRef = useRef(inputValue);
+  inputValueRef.current = inputValue;
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -239,6 +248,26 @@ export default function App() {
       abortControllerRef.current = controller;
 
       let accumulated = '';
+      let chunkRafId: number | null = null;
+
+      const flushAccumulatedToState = () => {
+        if (chunkRafId !== null) {
+          window.cancelAnimationFrame(chunkRafId);
+          chunkRafId = null;
+        }
+        const snapshot = accumulated;
+        setConversations((prev) =>
+          prev.map((conv) => {
+            if (conv.id !== targetConvId) return conv;
+            return {
+              ...conv,
+              messages: conv.messages.map((msg) =>
+                msg.id === assistantMsg.id ? { ...msg, text: snapshot } : msg,
+              ),
+            };
+          }),
+        );
+      };
 
       try {
         const recentHistory = historyWithUser.slice(-4);
@@ -260,19 +289,26 @@ export default function App() {
           signal: controller.signal,
           onChunk: (delta) => {
             accumulated += delta;
-            setConversations((prev) =>
-              prev.map((conv) => {
-                if (conv.id !== targetConvId) return conv;
-                return {
-                  ...conv,
-                  messages: conv.messages.map((msg) =>
-                    msg.id === assistantMsg.id ? { ...msg, text: accumulated } : msg,
-                  ),
-                };
-              }),
-            );
+            if (chunkRafId === null) {
+              chunkRafId = window.requestAnimationFrame(() => {
+                chunkRafId = null;
+                const snapshot = accumulated;
+                setConversations((prev) =>
+                  prev.map((conv) => {
+                    if (conv.id !== targetConvId) return conv;
+                    return {
+                      ...conv,
+                      messages: conv.messages.map((msg) =>
+                        msg.id === assistantMsg.id ? { ...msg, text: snapshot } : msg,
+                      ),
+                    };
+                  }),
+                );
+              });
+            }
           },
         });
+        flushAccumulatedToState();
 
         let storageWarning: string | undefined;
         setConversations((prev) => {
@@ -297,6 +333,10 @@ export default function App() {
           setErrorState({ message: storageWarning, retryable: false });
         }
       } catch (err) {
+        if (chunkRafId !== null) {
+          window.cancelAnimationFrame(chunkRafId);
+          chunkRafId = null;
+        }
         const isAbort =
           (err instanceof DOMException || err instanceof Error) && err.name === 'AbortError';
         if (isAbort) {
@@ -351,7 +391,7 @@ export default function App() {
 
   const handleSendMessage = useCallback(
     (overrideText?: string) => {
-      const textToSend = (overrideText ?? inputValue).trim();
+      const textToSend = (overrideText ?? inputValueRef.current).trim();
       const imageToSend = overrideText !== undefined ? null : pendingImage;
 
       if (
@@ -463,13 +503,25 @@ export default function App() {
     [
       activeConversation,
       activeId,
-      inputValue,
       isGenerating,
       isProcessingImage,
       pendingImage,
       runAssistantTurn,
     ],
   );
+
+  const handleCloseSidebar = useCallback(() => setSidebarOpen(false), []);
+  const handleToggleTheme = useCallback(
+    () => setTheme((t) => (t === 'dark' ? 'light' : 'dark')),
+    [],
+  );
+  const handleRequestDelete = useCallback(
+    (conv: Conversation) => setPendingDelete(conv),
+    [],
+  );
+  const handleSubmitCurrent = useCallback(() => handleSendMessage(), [handleSendMessage]);
+  const handleRemoveImage = useCallback(() => setPendingImage(null), []);
+  const handleClearImageError = useCallback(() => setImageError(null), []);
 
   const handleRetryLast = useCallback(() => {
     if (
@@ -516,15 +568,15 @@ export default function App() {
     <div className="flex h-dvh w-full overflow-hidden bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
       <Sidebar
         open={sidebarOpen}
-        onClose={() => setSidebarOpen(false)}
+        onClose={handleCloseSidebar}
         conversations={conversations}
         activeId={activeId}
         onSelectConversation={handleSelectConversation}
         onNewChat={handleNewChat}
         onRenameConversation={handleRenameConversation}
-        onRequestDelete={(conv) => setPendingDelete(conv)}
+        onRequestDelete={handleRequestDelete}
         theme={theme}
-        onToggleTheme={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+        onToggleTheme={handleToggleTheme}
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
@@ -634,15 +686,15 @@ export default function App() {
         <ChatInput
           value={inputValue}
           onChange={setInputValue}
-          onSubmit={() => handleSendMessage()}
+          onSubmit={handleSubmitCurrent}
           onStop={handleStopGenerating}
           isGenerating={isGenerating}
           pendingImage={pendingImage}
           isProcessingImage={isProcessingImage}
           imageError={imageError}
           onSelectImageFile={handleSelectImageFile}
-          onRemoveImage={() => setPendingImage(null)}
-          onClearImageError={() => setImageError(null)}
+          onRemoveImage={handleRemoveImage}
+          onClearImageError={handleClearImageError}
         />
       </div>
 

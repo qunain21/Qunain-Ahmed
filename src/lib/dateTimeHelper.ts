@@ -278,6 +278,29 @@ export function findKnownCity(query: string): KnownCityInfo | null {
   return KNOWN_CITIES[cleaned] ?? null;
 }
 
+const KNOWN_CITY_KEYS = Object.keys(KNOWN_CITIES).sort((a, b) => b.length - a.length);
+
+export function extractMentionedKnownCities(text: string, limit = 3): KnownCityInfo[] {
+  const normalized = ` ${text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()} `;
+  const found: KnownCityInfo[] = [];
+  const seenNames = new Set<string>();
+  for (const key of KNOWN_CITY_KEYS) {
+    if (normalized.includes(` ${key} `)) {
+      const city = KNOWN_CITIES[key];
+      if (!seenNames.has(city.name)) {
+        seenNames.add(city.name);
+        found.push(city);
+        if (found.length >= limit) break;
+      }
+    }
+  }
+  return found;
+}
+
 export function isValidTimeZone(tz?: string): tz is string {
   if (!tz || typeof tz !== 'string') return false;
   try {
@@ -322,22 +345,22 @@ export function parseDateTimeQuery(text: string): DateTimeQuery | null {
       lower,
     );
   const asksDate =
-    /^(what\s+is\s+|what'?s\s+|tell\s+me\s+|check\s+)?(today'?s?|the\s+current|current|the)?\s*(date|day\s+and\s+date|day\s+of\s+(?:the\s+)?week)(\s+(today|right\s+now|in\s+.+|at\s+.+|for\s+.+|of\s+.+))?$/i.test(
+    /^(what\s+is\s+|what'?s\s+|tell\s+me\s+|check\s+|give\s+me\s+)?(today'?s?|the\s+current|current|the)?\s*(date|day\s+and\s+date|day\s+of\s+(?:the\s+)?week)(\s+(today|right\s+now|please|in\s+.+|at\s+.+|for\s+.+|of\s+.+))?$/i.test(
       lower,
     ) ||
-    /^(today'?s?\s+date|current\s+date|what\s+day\s+is\s+(?:it|today)|aaj\s+(?:ki\s+)?(?:date|tareekh|tarikh|din)\s*(?:kya\s+hai|kia\s+hai|kon\s*sa\s+hai)?|(?:date|tareekh)\s+(?:in|of)\s+.+)$/i.test(
+    /^(today'?s?\s+date|today\s+date|current\s+date|date\s+please|what\s+day\s+is\s+(?:it|today)|aaj\s+(?:ki\s+)?(?:kya\s+)?(?:date|tareekh|tarikh|din)\s*(?:kya\s+hai|kia\s+hai|kon\s*sa\s+hai|hai)?|(?:date|tareekh)\s+(?:kya\s+hai|kia\s+hai|in\s+.+|of\s+.+))$/i.test(
       lower,
     ) ||
-    /^(?:[a-z\s]+?)\s+(?:me|mein)\s+aaj\s+(?:ki\s+)?(?:date|tareekh)\s*(?:kya\s+hai)?$/i.test(
+    /^(?:[a-z\s]+?)\s+(?:me|mein)\s+aaj\s+(?:ki\s+)?(?:kya\s+)?(?:date|tareekh)\s*(?:kya\s+hai|hai)?$/i.test(
       lower,
     ) ||
     /^[a-z\s-]{2,30}\s+(?:today'?s?\s+)?date$/i.test(lower);
 
   const asksTime =
-    /^(what\s+is\s+|what'?s\s+|tell\s+me\s+|check\s+)?(the\s+)?(current\s+|local\s+)?time(\s+(is\s+it|now|right\s+now|in\s+.+|at\s+.+|for\s+.+|of\s+.+))?$/i.test(
+    /^(what\s+is\s+|what'?s\s+|tell\s+me\s+|check\s+|give\s+me\s+)?(the\s+)?(current\s+|local\s+)?time(\s+(is\s+it|now|right\s+now|please|in\s+.+|at\s+.+|for\s+.+|of\s+.+))?$/i.test(
       lower,
     ) ||
-    /^(what\s+time\s+is\s+it|abhi\s+kya\s+(?:time|waqt)\s+(?:hua\s+)?hai|time\s+kya\s+hua\s+hai)(.*)$/i.test(
+    /^(what\s+time\s+is\s+it|time\s+please|abhi\s+kya\s+(?:time|waqt)\s+(?:hua\s+)?hai|time\s+kya\s+hua\s+hai)(.*)$/i.test(
       lower,
     ) ||
     /^(?:[a-z\s]+?)\s+(?:me|mein)\s+(?:abhi\s+)?kya\s+(?:time|waqt)\s+(?:hua\s+)?hai$/i.test(
@@ -352,21 +375,44 @@ export function parseDateTimeQuery(text: string): DateTimeQuery | null {
   let locationQuery: string | undefined;
   const prepMatch = /\b(?:in|at|for|of)\s+([a-zA-Z\s-]{2,40})$/i.exec(lower);
   if (prepMatch) {
-    locationQuery = cleanLocationFragment(prepMatch[1]);
+    const candidate = cleanLocationFragment(prepMatch[1]);
+    if (
+      candidate &&
+      !/^(today|todays|the\s+week|week|month|year|day|now|right\s+now)$/i.test(candidate)
+    ) {
+      locationQuery = candidate;
+    }
   } else {
-    const urduCityMatch = /^([a-zA-Z\s-]{2,30})\s+(?:me|mein)\s+/i.exec(lower);
+    const urduCityMatch =
+      /^([a-zA-Z\s-]{2,30})\s+(?:mein|me)\s+(?:aaj|abhi|kya|date|tareekh|tarikh|time|waqt)\b/i.exec(
+        lower,
+      );
     if (urduCityMatch) {
-      locationQuery = cleanLocationFragment(urduCityMatch[1]);
+      const candidate = cleanLocationFragment(urduCityMatch[1]);
+      if (
+        candidate &&
+        !/^(tell|give|show|ask|let|help|remind|send|what|check)$/i.test(candidate)
+      ) {
+        locationQuery = candidate;
+      }
     } else {
+      const strippedPrefix = lower
+        .replace(
+          /^(?:please\s+|can\s+you\s+)?(?:what\s+is\s+|what'?s\s+|tell\s+me\s+|give\s+me\s+|show\s+me\s+|check\s+)?(?:the\s+)?/i,
+          '',
+        )
+        .trim();
       const prefixCityMatch =
         /^([a-zA-Z\s-]{2,30}?)\s+(?:current\s+|local\s+|today'?s?\s+)?(?:date|time)$/i.exec(
-          lower,
+          strippedPrefix,
         );
       if (prefixCityMatch) {
         const candidate = cleanLocationFragment(prefixCityMatch[1]);
         if (
           candidate &&
-          !/^(today|todays|current|local|the|what|whats|check|tell|me)$/i.test(candidate)
+          !/^(today|todays|current|local|the|what|what\s+is|whats|check|tell|tell\s+me|give|give\s+me|me|is)$/i.test(
+            candidate,
+          )
         ) {
           locationQuery = candidate;
         }
