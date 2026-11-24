@@ -1,3 +1,4 @@
+import type { IncomingMessage as HttpIncomingMessage, ServerResponse } from 'http';
 import {
   buildStructuredDateTime,
   extractMentionedKnownCities,
@@ -233,16 +234,23 @@ function inferCityFromTimeZone(tz?: string): string | undefined {
   return cityPart.replace(/_/g, ' ');
 }
 
+export type WeatherFailureReason = 'MISSING_LOCATION' | 'NOT_FOUND' | 'PROVIDER_ERROR';
+
+export type LiveWeatherResult =
+  | { ok: true; data: LiveWeatherData; cached: boolean }
+  | { ok: false; reason: WeatherFailureReason; error: string; target?: string };
+
 export async function fetchLiveWeatherData(options: {
   locationQuery?: string;
   clientTimeZone?: string;
-}): Promise<{ ok: true; data: LiveWeatherData } | { ok: false; error: string; target?: string }> {
+}): Promise<LiveWeatherResult> {
   const targetLocation =
-    options.locationQuery || inferCityFromTimeZone(options.clientTimeZone);
+    options.locationQuery?.trim() || inferCityFromTimeZone(options.clientTimeZone);
 
   if (!targetLocation) {
     return {
       ok: false,
+      reason: 'MISSING_LOCATION',
       error: 'No city or location was specified.',
     };
   }
@@ -250,7 +258,7 @@ export async function fetchLiveWeatherData(options: {
   const cacheKey = targetLocation.toLowerCase().trim();
   const cached = weatherCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
-    return { ok: true, data: cached.data };
+    return { ok: true, data: cached.data, cached: true };
   }
 
   try {
@@ -258,6 +266,7 @@ export async function fetchLiveWeatherData(options: {
     if (!geo) {
       return {
         ok: false,
+        reason: 'NOT_FOUND',
         target: targetLocation,
         error: `Location "${targetLocation}" was not found.`,
       };
@@ -272,6 +281,7 @@ export async function fetchLiveWeatherData(options: {
     if (!wx.current || typeof wx.current.temperature_2m !== 'number') {
       return {
         ok: false,
+        reason: 'PROVIDER_ERROR',
         target: targetLocation,
         error: 'Live weather fields were unavailable from the weather provider.',
       };
@@ -326,97 +336,354 @@ export async function fetchLiveWeatherData(options: {
     return {
       ok: true,
       data: liveData,
+      cached: false,
     };
   } catch {
     return {
       ok: false,
+      reason: 'PROVIDER_ERROR',
       target: targetLocation,
       error: `Unable to retrieve live weather data for "${targetLocation}" right now.`,
     };
   }
 }
 
+const CITY_STOPWORDS = new Set([
+  'today',
+  'todays',
+  'tomorrow',
+  'now',
+  'currently',
+  'right now',
+  'please',
+  'the',
+  'aaj',
+  'abhi',
+  'weather',
+  'forecast',
+  'temperature',
+  'temp',
+  'rain',
+  'umbrella',
+  'jacket',
+  'date',
+  'time',
+  'me',
+  'my',
+  'this',
+  'that',
+  'live',
+  'morning',
+  'afternoon',
+  'evening',
+  'night',
+  'weekend',
+]);
+
+function extractAdditionalCityQueries(text: string, alreadyKnown: string[], limit: number): string[] {
+  const seen = new Set(alreadyKnown.map((c) => c.toLowerCase()));
+  const extra: string[] = [];
+
+  const matches = [
+    ...text.matchAll(
+      /\b(?:in|at|for|of)\s+([A-Z\p{L}][\p{L}\p{N}'-]+(?:\s+[A-Z\p{L}][\p{L}\p{N}'-]+)?)(?=\s*(?:today|now|currently|right\s+now|and\b|or\b|vs\b|,|\.|\?|$))/giu,
+    ),
+    ...text.matchAll(
+      /\b([A-Z\p{L}][\p{L}\p{N}'-]+)\s+(?:and|vs)\s+([A-Z\p{L}][\p{L}\p{N}'-]+)\b/giu,
+    ),
+  ];
+
+  for (const m of matches) {
+    for (let g = 1; g < m.length; g++) {
+      const raw = m[g]?.trim();
+      if (!raw) continue;
+      const cleaned = raw
+        .replace(/\b(today|now|currently|right\s+now|aaj|abhi|the)\b/gi, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const lower = cleaned.toLowerCase();
+      if (
+        cleaned.length >= 2 &&
+        cleaned.length <= 35 &&
+        !CITY_STOPWORDS.has(lower) &&
+        !seen.has(lower)
+      ) {
+        seen.add(lower);
+        extra.push(cleaned);
+        if (extra.length >= limit) return extra;
+      }
+    }
+  }
+  return extra;
+}
+
 export async function preGroundLiveWeatherContext(
   text: string,
   clientTimeZone?: string,
-): Promise<{ groundedFacts: string; cityCount: number }> {
-  const cities = extractMentionedKnownCities(text, 3);
-  if (cities.length === 0) {
-    return { groundedFacts: '', cityCount: 0 };
+): Promise<{ groundedFacts: string; cityCount: number; hasProviderError: boolean }> {
+  const knownCities = extractMentionedKnownCities(text, 3).map((c) => c.name);
+  const extraCities =
+    knownCities.length < 3
+      ? extractAdditionalCityQueries(text, knownCities, 3 - knownCities.length)
+      : [];
+
+  let targetCities = [...knownCities, ...extraCities].slice(0, 3);
+  if (targetCities.length === 0) {
+    const tzCity = inferCityFromTimeZone(clientTimeZone);
+    if (tzCity) {
+      targetCities = [tzCity];
+    }
   }
 
+  if (targetCities.length === 0) {
+    return { groundedFacts: '', cityCount: 0, hasProviderError: false };
+  }
+
+  let hasProviderError = false;
   const results = await Promise.all(
-    cities.map(async (city) => {
+    targetCities.map(async (city) => {
       const res = await fetchLiveWeatherData({
-        locationQuery: city.name,
+        locationQuery: city,
         clientTimeZone,
       });
-      return res.ok
-        ? `${res.data.location} (${res.data.date} ${res.data.localTime}): ${res.data.condition}, ${res.data.temperatureC}°C (feels like ${res.data.feelsLikeC ?? res.data.temperatureC}°C), high/low ${res.data.highC ?? '-'}°C/${res.data.lowC ?? '-'}°C, humidity ${res.data.humidityPercent ?? '-'}%, wind ${res.data.windSpeedKmh ?? '-'} km/h.`
-        : `${city.name}: live weather unavailable (${res.error}).`;
+      if (res.ok) {
+        return `${res.data.location} (${res.data.date} ${res.data.localTime}): ${res.data.condition}, ${res.data.temperatureC}°C (feels like ${res.data.feelsLikeC ?? res.data.temperatureC}°C), high/low ${res.data.highC ?? '-'}°C/${res.data.lowC ?? '-'}°C, humidity ${res.data.humidityPercent ?? '-'}%, wind ${res.data.windSpeedKmh ?? '-'} km/h.`;
+      }
+      if (res.reason === 'PROVIDER_ERROR') {
+        hasProviderError = true;
+      }
+      return `${city}: live weather unavailable (${res.error}).`;
     }),
   );
 
   return {
     groundedFacts: results.join(' | '),
-    cityCount: cities.length,
+    cityCount: targetCities.length,
+    hasProviderError,
   };
+}
+
+export function formatLiveWeatherReply(
+  data: LiveWeatherData,
+  preferUrdu: boolean,
+): string {
+  if (preferUrdu) {
+    const lines = [
+      `**${data.location} ka Live Mausam** (${data.date} · ${data.localTime})`,
+      `- **Condition:** ${data.conditionUrdu}`,
+      `- **Temperature:** ${data.temperatureC}°C${data.feelsLikeC !== undefined ? ` (Feels like ${data.feelsLikeC}°C)` : ''}`,
+    ];
+    if (data.highC !== undefined && data.lowC !== undefined) {
+      lines.push(`- **Aaj ka High / Low:** ${data.highC}°C / ${data.lowC}°C`);
+    }
+    if (typeof data.humidityPercent === 'number') {
+      lines.push(`- **Humidity:** ${data.humidityPercent}%`);
+    }
+    if (data.windSpeedKmh !== undefined) {
+      lines.push(`- **Hawa (Wind):** ${data.windSpeedKmh} km/h`);
+    }
+    return lines.join('\n');
+  }
+
+  const lines = [
+    `**Current Weather in ${data.location}** (${data.date} · ${data.localTime})`,
+    `- **Condition:** ${data.condition}`,
+    `- **Temperature:** ${data.temperatureC}°C${data.feelsLikeC !== undefined ? ` (Feels like ${data.feelsLikeC}°C)` : ''}`,
+  ];
+  if (data.highC !== undefined && data.lowC !== undefined) {
+    lines.push(`- **Today's High / Low:** ${data.highC}°C / ${data.lowC}°C`);
+  }
+  if (typeof data.humidityPercent === 'number') {
+    lines.push(`- **Humidity:** ${data.humidityPercent}%`);
+  }
+  if (data.windSpeedKmh !== undefined) {
+    lines.push(`- **Wind:** ${data.windSpeedKmh} km/h`);
+  }
+  return lines.join('\n');
 }
 
 export async function fetchLiveWeatherReply(options: {
   locationQuery?: string;
   clientTimeZone?: string;
   preferUrdu: boolean;
-}): Promise<string> {
+}): Promise<
+  | { ok: true; reply: string }
+  | { ok: false; reason: WeatherFailureReason; reply: string }
+> {
   const result = await fetchLiveWeatherData({
     locationQuery: options.locationQuery,
     clientTimeZone: options.clientTimeZone,
   });
 
   if (!result.ok) {
-    if (!result.target) {
-      return options.preferUrdu
-        ? 'Barah-e-karam shehar ka naam batayein (maslan "Karachi ka mausam") taake main aap ko live weather bata sakoon.'
-        : 'Please specify a city or location (for example, "weather in Karachi") so I can fetch live weather data.';
+    if (result.reason === 'MISSING_LOCATION') {
+      return {
+        ok: false,
+        reason: result.reason,
+        reply: options.preferUrdu
+          ? 'Barah-e-karam shehar ka naam batayein (maslan "Karachi ka mausam") taake main aap ko live weather bata sakoon.'
+          : 'Please specify a city or location (for example, "weather in Karachi") so I can fetch live weather data.',
+      };
     }
-    return options.preferUrdu
-      ? `Is waqt **${result.target}** ka live weather data haasil nahi ho saka. Barah-e-karam kuch dair baad dobara koshish karein.`
-      : `Live weather data for **${result.target}** is temporarily unavailable right now. Please try again in a moment.`;
+    if (result.reason === 'NOT_FOUND') {
+      return {
+        ok: false,
+        reason: result.reason,
+        reply: options.preferUrdu
+          ? `Mujhe **${result.target ?? 'is shehar'}** ke liye live weather location nahi mil saki. Barah-e-karam shehar ka sahi naam likhein.`
+          : `I could not find a matching city for **${result.target ?? 'that location'}**. Please check the city name and try again.`,
+      };
+    }
+    return {
+      ok: false,
+      reason: result.reason,
+      reply: options.preferUrdu
+        ? `Is waqt **${result.target ?? 'mausam'}** ka live weather data haasil nahi ho saka. Barah-e-karam dobara koshish karein.`
+        : `Live weather data for **${result.target ?? 'this location'}** is temporarily unavailable right now. Please try again.`,
+    };
   }
 
-  const d = result.data;
+  return {
+    ok: true,
+    reply: formatLiveWeatherReply(result.data, options.preferUrdu),
+  };
+}
 
-  if (options.preferUrdu) {
-    const lines = [
-      `**${d.location} ka Live Mausam** (${d.date} · ${d.localTime})`,
-      `- **Condition:** ${d.conditionUrdu}`,
-      `- **Temperature:** ${d.temperatureC}°C${d.feelsLikeC !== undefined ? ` (Feels like ${d.feelsLikeC}°C)` : ''}`,
-    ];
-    if (d.highC !== undefined && d.lowC !== undefined) {
-      lines.push(`- **Aaj ka High / Low:** ${d.highC}°C / ${d.lowC}°C`);
+function writeWeatherJson(
+  res: ServerResponse,
+  status: number,
+  payload: unknown,
+  cacheHeader = 'no-store',
+): void {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', cacheHeader);
+  res.end(JSON.stringify(payload));
+}
+
+async function readWeatherPostBody(
+  req: HttpIncomingMessage & { body?: unknown },
+): Promise<{ city?: string; location?: string; timeZone?: string }> {
+  if (req.body !== undefined && req.body !== null) {
+    if (typeof req.body === 'string') {
+      return JSON.parse(req.body) as { city?: string; location?: string; timeZone?: string };
     }
-    if (typeof d.humidityPercent === 'number') {
-      lines.push(`- **Humidity:** ${d.humidityPercent}%`);
-    }
-    if (d.windSpeedKmh !== undefined) {
-      lines.push(`- **Hawa (Wind):** ${d.windSpeedKmh} km/h`);
-    }
-    return lines.join('\n');
+    return req.body as { city?: string; location?: string; timeZone?: string };
+  }
+  return await new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    req.on('data', (chunk: Buffer | string) => {
+      const buf = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+      total += buf.length;
+      if (total > 16 * 1024) {
+        reject(new Error('PAYLOAD_TOO_LARGE'));
+        req.destroy();
+        return;
+      }
+      chunks.push(buf);
+    });
+    req.on('end', () => {
+      if (chunks.length === 0) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      } catch {
+        reject(new Error('INVALID_JSON'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+export async function handleWeatherRequest(
+  req: HttpIncomingMessage & { body?: unknown },
+  res: ServerResponse,
+): Promise<void> {
+  if (req.method === 'OPTIONS') {
+    res.statusCode = 204;
+    res.end();
+    return;
   }
 
-  const lines = [
-    `**Current Weather in ${d.location}** (${d.date} · ${d.localTime})`,
-    `- **Condition:** ${d.condition}`,
-    `- **Temperature:** ${d.temperatureC}°C${d.feelsLikeC !== undefined ? ` (Feels like ${d.feelsLikeC}°C)` : ''}`,
-  ];
-  if (d.highC !== undefined && d.lowC !== undefined) {
-    lines.push(`- **Today's High / Low:** ${d.highC}°C / ${d.lowC}°C`);
+  let cityQuery: string | undefined;
+  let timeZoneQuery: string | undefined;
+
+  if (req.method === 'GET') {
+    const parsedUrl = new URL(req.url ?? '/api/weather', 'http://localhost');
+    cityQuery =
+      parsedUrl.searchParams.get('city')?.trim() ||
+      parsedUrl.searchParams.get('q')?.trim() ||
+      parsedUrl.searchParams.get('location')?.trim() ||
+      undefined;
+    timeZoneQuery =
+      parsedUrl.searchParams.get('tz')?.trim() ||
+      parsedUrl.searchParams.get('timeZone')?.trim() ||
+      undefined;
+  } else if (req.method === 'POST') {
+    try {
+      const body = await readWeatherPostBody(req);
+      cityQuery =
+        (typeof body.city === 'string' && body.city.trim()) ||
+        (typeof body.location === 'string' && body.location.trim()) ||
+        undefined;
+      timeZoneQuery =
+        typeof body.timeZone === 'string' && body.timeZone.trim()
+          ? body.timeZone.trim()
+          : undefined;
+    } catch {
+      writeWeatherJson(res, 400, {
+        ok: false,
+        error: 'Invalid JSON request body.',
+        code: 'INVALID_JSON',
+        retryable: false,
+      });
+      return;
+    }
+  } else {
+    writeWeatherJson(res, 405, {
+      ok: false,
+      error: 'Method not allowed.',
+      code: 'METHOD_NOT_ALLOWED',
+      retryable: false,
+    });
+    return;
   }
-  if (typeof d.humidityPercent === 'number') {
-    lines.push(`- **Humidity:** ${d.humidityPercent}%`);
+
+  const startMs = Date.now();
+  const result = await fetchLiveWeatherData({
+    locationQuery: cityQuery,
+    clientTimeZone: isValidTimeZone(timeZoneQuery) ? timeZoneQuery : undefined,
+  });
+  const dur = Date.now() - startMs;
+  res.setHeader('Server-Timing', `weather;desc="${result.ok && result.cached ? 'cache' : 'open-meteo'}";dur=${dur}`);
+
+  if (!result.ok) {
+    const status =
+      result.reason === 'MISSING_LOCATION'
+        ? 400
+        : result.reason === 'NOT_FOUND'
+          ? 404
+          : 502;
+    writeWeatherJson(res, status, {
+      ok: false,
+      error: result.error,
+      code: result.reason,
+      retryable: result.reason === 'PROVIDER_ERROR',
+    });
+    return;
   }
-  if (d.windSpeedKmh !== undefined) {
-    lines.push(`- **Wind:** ${d.windSpeedKmh} km/h`);
-  }
-  return lines.join('\n');
+
+  writeWeatherJson(
+    res,
+    200,
+    {
+      ok: true,
+      cached: result.cached,
+      data: result.data,
+    },
+    'public, max-age=60, s-maxage=180',
+  );
 }

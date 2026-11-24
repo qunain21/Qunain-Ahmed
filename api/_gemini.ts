@@ -39,8 +39,8 @@ const PRIMARY_MODEL = 'gemini-3.1-flash-lite';
 const FALLBACK_FREE_MODEL = 'gemini-4-hydrogen';
 const MAX_SERVER_RETRIES = 1;
 const MAX_AUTO_RETRY_DELAY_MS = 700;
-const UPSTREAM_CONNECT_TIMEOUT_MS = 14000;
-const STREAM_IDLE_TIMEOUT_MS = 14000;
+const UPSTREAM_CONNECT_TIMEOUT_MS = 18000;
+const STREAM_IDLE_TIMEOUT_MS = 18000;
 const MAX_BODY_BYTES = 6 * 1024 * 1024;
 
 interface IncomingImage {
@@ -959,13 +959,22 @@ export async function handleChatRequest(
     const weatherQuery = parseWeatherQuery(latestMessage.text);
     if (weatherQuery) {
       const wxStart = Date.now();
-      const weatherReply = await fetchLiveWeatherReply({
+      const weatherResult = await fetchLiveWeatherReply({
         locationQuery: weatherQuery.locationQuery,
         clientTimeZone,
         preferUrdu,
       });
+      if (!weatherResult.ok && weatherResult.reason === 'PROVIDER_ERROR') {
+        sendJson(res, 502, {
+          error: weatherResult.reply,
+          code: 'WEATHER_UNAVAILABLE',
+          retryable: true,
+          retryAfterSeconds: 3,
+        });
+        return;
+      }
       writeSingleSseReply(
-        weatherReply,
+        weatherResult.reply,
         `weather;desc="open-meteo";dur=${Date.now() - wxStart}`,
       );
       return;
@@ -1037,10 +1046,10 @@ export async function handleChatRequest(
   const weatherIntent = hasWeatherIntent(sanitized);
   const preGrounded = weatherIntent
     ? await preGroundLiveWeatherContext(
-        sanitized.map((m) => m.text).join(' '),
+        latestMessage.text || sanitized.map((m) => m.text).join(' '),
         clientTimeZone,
       )
-    : { groundedFacts: '', cityCount: 0 };
+    : { groundedFacts: '', cityCount: 0, hasProviderError: false };
 
   const systemInstruction = buildSystemInstruction(
     language,
@@ -1051,7 +1060,7 @@ export async function handleChatRequest(
   );
   const startMs = Date.now();
 
-  // Only invoke Gemini FunctionDeclaration round-trips when weather is needed for an unrecognized city
+  // Only invoke Gemini FunctionDeclaration round-trips when weather is needed and pre-grounding found no city
   const enableTools = weatherIntent && preGrounded.cityCount === 0;
   const trimmedPrompt = latestMessage.text.trim();
   const isDetailedRequest =

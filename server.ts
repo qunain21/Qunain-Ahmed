@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { handleChatRequest } from './api/_gemini';
+import { handleWeatherRequest } from './api/_weather';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -27,6 +28,10 @@ async function startServer() {
 
   app.post('/api/chat', async (req: Request, res: Response) => {
     await handleChatRequest(req, res);
+  });
+
+  app.all('/api/weather', async (req: Request, res: Response) => {
+    await handleWeatherRequest(req, res);
   });
 
   app.use('/api', (_req: Request, res: Response) => {
