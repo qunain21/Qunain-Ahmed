@@ -1,0 +1,6 @@
+{
+  "name": "SwiftChat",
+  "description": "A fast, minimal AI chatbot powered by Google Gemini with persistent local chat history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
