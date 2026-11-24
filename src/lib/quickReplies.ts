@@ -1,3 +1,10 @@
+import {
+  findKnownCity,
+  formatDateTimeReply,
+  isValidTimeZone,
+  parseDateTimeQuery,
+} from './dateTimeHelper.js';
+
 export type ConversationLanguage = 'auto' | 'urdu' | 'english';
 
 export interface QuickReplyMatch {
@@ -30,9 +37,10 @@ export function looksLikeRomanUrdu(text: string): boolean {
 export function matchInstantReply(
   text: string,
   currentLanguage: ConversationLanguage = 'auto',
+  clientTimeZone?: string,
 ): QuickReplyMatch | null {
   const rawTrimmed = text.trim();
-  if (!rawTrimmed || rawTrimmed.length > 60) return null;
+  if (!rawTrimmed || rawTrimmed.length > 90) return null;
 
   const norm = normalizePhrase(rawTrimmed);
   if (!norm) return null;
@@ -64,6 +72,38 @@ export function matchInstantReply(
 
   const preferUrdu =
     currentLanguage === 'urdu' || isUrduScript(rawTrimmed) || looksLikeRomanUrdu(rawTrimmed);
+
+  // Instant current date/time queries for local timezone or known cities
+  const dateQuery = parseDateTimeQuery(rawTrimmed);
+  if (dateQuery) {
+    if (!dateQuery.locationQuery) {
+      const tz = isValidTimeZone(clientTimeZone) ? clientTimeZone : 'UTC';
+      return {
+        reply: formatDateTimeReply({
+          kind: dateQuery.kind,
+          timeZone: tz,
+          preferUrdu,
+        }),
+      };
+    }
+    const city = findKnownCity(dateQuery.locationQuery);
+    if (city) {
+      const label =
+        city.country && city.country !== city.name ? `${city.name}, ${city.country}` : city.name;
+      return {
+        reply: formatDateTimeReply({
+          kind: dateQuery.kind,
+          timeZone: city.timeZone,
+          locationLabel: label,
+          preferUrdu,
+        }),
+      };
+    }
+    // Unknown city falls through to /api/chat dynamic timezone resolver
+    return null;
+  }
+
+  if (rawTrimmed.length > 60) return null;
 
   // Salam variants (handles common spellings like "assalam alikum", "as salamu alaykum", "aoa", etc.)
   if (

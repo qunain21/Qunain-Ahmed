@@ -241,7 +241,11 @@ export default function App() {
       let accumulated = '';
 
       try {
-        const recentHistory = historyWithUser.slice(-6);
+        const recentHistory = historyWithUser.slice(-4);
+        const clientTimeZone =
+          typeof Intl !== 'undefined'
+            ? Intl.DateTimeFormat().resolvedOptions().timeZone
+            : undefined;
         await streamChatCompletion({
           messages: recentHistory.map((m, idx) => ({
             role: m.role,
@@ -252,6 +256,7 @@ export default function App() {
                 : undefined,
           })),
           language,
+          timeZone: clientTimeZone,
           signal: controller.signal,
           onChunk: (delta) => {
             accumulated += delta;
@@ -366,8 +371,12 @@ export default function App() {
 
       const currentLanguage: ConversationLanguage =
         activeConversation?.preferredLanguage ?? 'auto';
+      const clientTimeZone =
+        typeof Intl !== 'undefined'
+          ? Intl.DateTimeFormat().resolvedOptions().timeZone
+          : undefined;
       const instantMatch = !imageToSend
-        ? matchInstantReply(textToSend, currentLanguage)
+        ? matchInstantReply(textToSend, currentLanguage, clientTimeZone)
         : null;
       const nextLanguage: ConversationLanguage =
         instantMatch?.nextLanguage ?? currentLanguage;

@@ -13,6 +13,7 @@ export interface StreamChatMessageInput {
 export interface StreamChatOptions {
   messages: StreamChatMessageInput[];
   language?: ConversationLanguage;
+  timeZone?: string;
   signal?: AbortSignal;
   onChunk: (deltaText: string) => void;
 }
@@ -68,6 +69,7 @@ const CLIENT_TIMEOUT_MS = 30000;
 export async function streamChatCompletion({
   messages,
   language,
+  timeZone,
   signal,
   onChunk,
 }: StreamChatOptions): Promise<string> {
@@ -93,6 +95,12 @@ export async function streamChatCompletion({
   };
   signal?.addEventListener('abort', onCallerAbort, { once: true });
 
+  const resolvedTimeZone =
+    timeZone ??
+    (typeof Intl !== 'undefined'
+      ? Intl.DateTimeFormat().resolvedOptions().timeZone
+      : undefined);
+
   try {
     try {
       response = await fetch('/api/chat', {
@@ -101,7 +109,7 @@ export async function streamChatCompletion({
           'Content-Type': 'application/json',
           Accept: 'text/event-stream, application/json',
         },
-        body: JSON.stringify({ messages, language }),
+        body: JSON.stringify({ messages, language, timeZone: resolvedTimeZone }),
         signal: requestController.signal,
       });
     } catch (err) {

@@ -7,6 +7,12 @@ import {
   looksLikeRomanUrdu,
   matchInstantReply,
 } from '../src/lib/quickReplies.js';
+import { isValidTimeZone, parseDateTimeQuery } from '../src/lib/dateTimeHelper.js';
+import {
+  fetchLiveWeatherReply,
+  parseWeatherQuery,
+  resolveDynamicDateTimeReply,
+} from './_weather.js';
 
 // Load .env.local first, then .env without overriding runtime-injected secrets
 dotenv.config({ path: '.env.local' });
@@ -16,8 +22,8 @@ const PRIMARY_MODEL = 'gemini-3.1-flash-lite';
 const FALLBACK_FREE_MODEL = 'gemini-4-hydrogen';
 const MAX_SERVER_RETRIES = 1;
 const MAX_AUTO_RETRY_DELAY_MS = 1000;
-const UPSTREAM_CONNECT_TIMEOUT_MS = 10000;
-const STREAM_IDLE_TIMEOUT_MS = 12000;
+const UPSTREAM_CONNECT_TIMEOUT_MS = 14000;
+const STREAM_IDLE_TIMEOUT_MS = 14000;
 const MAX_BODY_BYTES = 6 * 1024 * 1024;
 
 interface IncomingImage {
@@ -51,15 +57,25 @@ function buildSystemInstruction(
   language: ConversationLanguage,
   latestText: string,
   hasImage: boolean,
+  clientTimeZone?: string,
 ): string {
+  const tz = isValidTimeZone(clientTimeZone) ? clientTimeZone : 'UTC';
+  const todayStr = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  }).format(new Date());
+  const dateContext = `Today is ${todayStr} (${tz}). Keep answers short and direct for simple questions.`;
   const imageHint = hasImage ? ' Inspect the image carefully to answer or extract text.' : '';
   if (isUrduScript(latestText)) {
-    return `Be concise and helpful. Reply naturally in Urdu script.${imageHint}`;
+    return `${dateContext} Reply concisely in Urdu script.${imageHint}`;
   }
   if (language === 'urdu' || looksLikeRomanUrdu(latestText)) {
-    return `Be concise and helpful. Reply naturally in clear Roman Urdu (or Urdu if the user writes in Urdu script).${imageHint}`;
+    return `${dateContext} Reply concisely in clear Roman Urdu (or Urdu if written in Urdu script).${imageHint}`;
   }
-  return `Be concise, direct, and helpful.${imageHint}`;
+  return `${dateContext}${imageHint}`;
 }
 
 const DATA_URL_REGEX = /^data:(image\/(?:jpeg|jpg|png|webp));base64,([A-Za-z0-9+/=]+)$/;
@@ -557,9 +573,13 @@ export async function handleChatRequest(
     return;
   }
 
-  let body: { messages?: unknown; language?: unknown };
+  let body: { messages?: unknown; language?: unknown; timeZone?: unknown };
   try {
-    body = (await readJsonBody(req)) as { messages?: unknown; language?: unknown };
+    body = (await readJsonBody(req)) as {
+      messages?: unknown;
+      language?: unknown;
+      timeZone?: unknown;
+    };
   } catch (err) {
     const code = err instanceof Error ? err.message : 'INVALID_JSON';
     if (code === 'PAYLOAD_TOO_LARGE') {
@@ -589,6 +609,10 @@ export async function handleChatRequest(
 
   const language: ConversationLanguage =
     body.language === 'urdu' || body.language === 'english' ? body.language : 'auto';
+  const clientTimeZone =
+    typeof body.timeZone === 'string' && isValidTimeZone(body.timeZone)
+      ? body.timeZone
+      : undefined;
 
   const sanitized: ChatMessageInput[] = body.messages
     .filter((m): m is ChatMessageInput => {
@@ -599,7 +623,7 @@ export async function handleChatRequest(
       const hasValidImage = candidate.role === 'user' && parseImagePart(candidate.image) !== null;
       return hasText || hasValidImage;
     })
-    .slice(-6);
+    .slice(-4);
 
   if (sanitized.length === 0 || sanitized[sanitized.length - 1].role !== 'user') {
     sendJson(res, 400, {
@@ -610,21 +634,63 @@ export async function handleChatRequest(
     return;
   }
 
+  const writeSingleSseReply = (replyText: string, serverTiming: string) => {
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.setHeader('Server-Timing', serverTiming);
+    res.flushHeaders?.();
+    res.write(`data: ${JSON.stringify({ text: replyText })}\n\n`);
+    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    res.end();
+  };
+
   const latestMessage = sanitized[sanitized.length - 1];
   const latestHasImage = parseImagePart(latestMessage.image) !== null;
   if (!latestHasImage) {
-    const instant = matchInstantReply(latestMessage.text, language);
+    const preferUrdu =
+      language === 'urdu' ||
+      isUrduScript(latestMessage.text) ||
+      looksLikeRomanUrdu(latestMessage.text);
+
+    const instant = matchInstantReply(latestMessage.text, language, clientTimeZone);
     if (instant) {
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-      res.setHeader('Cache-Control', 'no-cache, no-transform');
-      res.setHeader('Connection', 'keep-alive');
-      res.setHeader('X-Accel-Buffering', 'no');
-      res.setHeader('Server-Timing', 'local;desc="instant";dur=0');
-      res.flushHeaders?.();
-      res.write(`data: ${JSON.stringify({ text: instant.reply })}\n\n`);
-      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-      res.end();
+      writeSingleSseReply(instant.reply, 'local;desc="instant";dur=0');
+      return;
+    }
+
+    const dynamicDateQuery = parseDateTimeQuery(latestMessage.text);
+    if (dynamicDateQuery) {
+      const dateStart = Date.now();
+      const dynamicDateReply = await resolveDynamicDateTimeReply({
+        kind: dynamicDateQuery.kind,
+        locationQuery: dynamicDateQuery.locationQuery,
+        clientTimeZone,
+        preferUrdu,
+      });
+      if (dynamicDateReply) {
+        writeSingleSseReply(
+          dynamicDateReply,
+          `local;desc="datetime";dur=${Date.now() - dateStart}`,
+        );
+        return;
+      }
+    }
+
+    const weatherQuery = parseWeatherQuery(latestMessage.text);
+    if (weatherQuery) {
+      const wxStart = Date.now();
+      const weatherReply = await fetchLiveWeatherReply({
+        locationQuery: weatherQuery.locationQuery,
+        clientTimeZone,
+        preferUrdu,
+      });
+      writeSingleSseReply(
+        weatherReply,
+        `weather;desc="open-meteo";dur=${Date.now() - wxStart}`,
+      );
       return;
     }
   }
@@ -695,6 +761,7 @@ export async function handleChatRequest(
     language,
     latestMessage.text,
     latestHasImage,
+    clientTimeZone,
   );
   const startMs = Date.now();
 
