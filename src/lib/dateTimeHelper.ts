@@ -322,7 +322,7 @@ export function parseDateTimeQuery(text: string): DateTimeQuery | null {
       lower,
     );
   const asksDate =
-    /^(what\s+is\s+|what'?s\s+|tell\s+me\s+)?(today'?s?|the\s+current|current|the)?\s*(date|day\s+and\s+date|day\s+of\s+(?:the\s+)?week)(\s+(today|right\s+now|in\s+.+|at\s+.+|for\s+.+|of\s+.+))?$/i.test(
+    /^(what\s+is\s+|what'?s\s+|tell\s+me\s+|check\s+)?(today'?s?|the\s+current|current|the)?\s*(date|day\s+and\s+date|day\s+of\s+(?:the\s+)?week)(\s+(today|right\s+now|in\s+.+|at\s+.+|for\s+.+|of\s+.+))?$/i.test(
       lower,
     ) ||
     /^(today'?s?\s+date|current\s+date|what\s+day\s+is\s+(?:it|today)|aaj\s+(?:ki\s+)?(?:date|tareekh|tarikh|din)\s*(?:kya\s+hai|kia\s+hai|kon\s*sa\s+hai)?|(?:date|tareekh)\s+(?:in|of)\s+.+)$/i.test(
@@ -330,10 +330,11 @@ export function parseDateTimeQuery(text: string): DateTimeQuery | null {
     ) ||
     /^(?:[a-z\s]+?)\s+(?:me|mein)\s+aaj\s+(?:ki\s+)?(?:date|tareekh)\s*(?:kya\s+hai)?$/i.test(
       lower,
-    );
+    ) ||
+    /^[a-z\s-]{2,30}\s+(?:today'?s?\s+)?date$/i.test(lower);
 
   const asksTime =
-    /^(what\s+is\s+|what'?s\s+|tell\s+me\s+)?(the\s+)?(current\s+|local\s+)?time(\s+(is\s+it|now|right\s+now|in\s+.+|at\s+.+|for\s+.+|of\s+.+))?$/i.test(
+    /^(what\s+is\s+|what'?s\s+|tell\s+me\s+|check\s+)?(the\s+)?(current\s+|local\s+)?time(\s+(is\s+it|now|right\s+now|in\s+.+|at\s+.+|for\s+.+|of\s+.+))?$/i.test(
       lower,
     ) ||
     /^(what\s+time\s+is\s+it|abhi\s+kya\s+(?:time|waqt)\s+(?:hua\s+)?hai|time\s+kya\s+hua\s+hai)(.*)$/i.test(
@@ -341,7 +342,8 @@ export function parseDateTimeQuery(text: string): DateTimeQuery | null {
     ) ||
     /^(?:[a-z\s]+?)\s+(?:me|mein)\s+(?:abhi\s+)?kya\s+(?:time|waqt)\s+(?:hua\s+)?hai$/i.test(
       lower,
-    );
+    ) ||
+    /^[a-z\s-]{2,30}\s+(?:current\s+|local\s+)?time$/i.test(lower);
 
   if (!hasDateAndTime && !asksDate && !asksTime) {
     return null;
@@ -355,12 +357,57 @@ export function parseDateTimeQuery(text: string): DateTimeQuery | null {
     const urduCityMatch = /^([a-zA-Z\s-]{2,30})\s+(?:me|mein)\s+/i.exec(lower);
     if (urduCityMatch) {
       locationQuery = cleanLocationFragment(urduCityMatch[1]);
+    } else {
+      const prefixCityMatch =
+        /^([a-zA-Z\s-]{2,30}?)\s+(?:current\s+|local\s+|today'?s?\s+)?(?:date|time)$/i.exec(
+          lower,
+        );
+      if (prefixCityMatch) {
+        const candidate = cleanLocationFragment(prefixCityMatch[1]);
+        if (
+          candidate &&
+          !/^(today|todays|current|local|the|what|whats|check|tell|me)$/i.test(candidate)
+        ) {
+          locationQuery = candidate;
+        }
+      }
     }
   }
 
   return {
     kind: hasDateAndTime ? 'datetime' : asksTime && !asksDate ? 'time' : 'date',
     locationQuery,
+  };
+}
+
+export function buildStructuredDateTime(timeZone: string, locationLabel?: string, now = new Date()) {
+  const tz = isValidTimeZone(timeZone) ? timeZone : 'UTC';
+  const date = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  }).format(now);
+  const time = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZoneName: 'short',
+  }).format(now);
+  const isoDate = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(now);
+  return {
+    location: locationLabel ?? tz,
+    timeZone: tz,
+    date,
+    isoDate,
+    time,
   };
 }
 
@@ -371,24 +418,11 @@ export function formatDateTimeReply(options: {
   preferUrdu?: boolean;
   now?: Date;
 }): string {
-  const now = options.now ?? new Date();
-  const tz = isValidTimeZone(options.timeZone) ? options.timeZone : 'UTC';
-
-  const dateStr = new Intl.DateTimeFormat('en-US', {
-    timeZone: tz,
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-  }).format(now);
-
-  const timeStr = new Intl.DateTimeFormat('en-US', {
-    timeZone: tz,
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true,
-    timeZoneName: 'short',
-  }).format(now);
+  const { date: dateStr, time: timeStr } = buildStructuredDateTime(
+    options.timeZone,
+    options.locationLabel,
+    options.now,
+  );
 
   const where = options.locationLabel ? ` in **${options.locationLabel}**` : '';
   const whereUrdu = options.locationLabel ? ` **${options.locationLabel}** mein` : '';

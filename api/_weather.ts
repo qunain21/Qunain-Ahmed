@@ -1,4 +1,5 @@
 import {
+  buildStructuredDateTime,
   findKnownCity,
   formatDateTimeReply,
   isValidTimeZone,
@@ -31,6 +32,21 @@ interface OpenMeteoForecastResponse {
   };
 }
 
+export interface LiveWeatherData {
+  location: string;
+  timeZone: string;
+  date: string;
+  localTime: string;
+  condition: string;
+  conditionUrdu: string;
+  temperatureC: number;
+  feelsLikeC?: number;
+  highC?: number;
+  lowC?: number;
+  humidityPercent?: number;
+  windSpeedKmh?: number;
+}
+
 function describeWmoWeatherCode(code: number | undefined, preferUrdu: boolean): string {
   if (code === undefined) return preferUrdu ? 'Mausam ki tafseel' : 'Current conditions';
   if (code === 0) return preferUrdu ? 'Saaf aasman (Clear sky)' : 'Clear sky';
@@ -61,9 +77,9 @@ export function parseWeatherQuery(text: string): { locationQuery?: string } | nu
     );
   if (!hasWeatherKeyword) return null;
 
-  // Avoid hijacking unrelated general questions like "why does weather change" or "how does temperature affect batteries"
+  // Let Gemini + tool calling handle multi-city comparisons, date+weather questions, advice, or complex queries
   if (
-    /\b(why\s+does|how\s+does|explain|define|what\s+causes|poem|story|code|api|app)\b/i.test(
+    /\b(why\s+does|how\s+does|explain|define|what\s+causes|poem|story|code|api|app|should\s+i|compare|better|hotter|colder|warmer|cooler|umbrella|jacket|wear|travel|tomorrow|week|date|confirm|wrong|outdated|and\s+(?:in|what|how))\b/i.test(
       lower,
     )
   ) {
@@ -71,10 +87,10 @@ export function parseWeatherQuery(text: string): { locationQuery?: string } | nu
   }
 
   const prepMatch =
-    /\b(?:weather|forecast|temperature|temp|mausam|mosam)\s+(?:right\s+now\s+|today\s+|currently\s+)?(?:in|for|at|of)\s+([a-zA-Z\s-]{2,40})$/i.exec(
+    /\b(?:weather|forecast|temperature|temp|mausam|mosam)\s+(?:right\s+now\s+|today\s+|currently\s+)?(?:in|for|at|of)\s+([\p{L}\p{N}\s'-]{2,45})$/iu.exec(
       lower,
     ) ||
-    /\b(?:in|for|at|of)\s+([a-zA-Z\s-]{2,40})\s+(?:today|now|currently|right\s+now)?$/i.exec(
+    /\b(?:in|for|at|of)\s+([\p{L}\p{N}\s'-]{2,45})\s+(?:today|now|currently|right\s+now)?$/iu.exec(
       lower,
     );
 
@@ -87,7 +103,7 @@ export function parseWeatherQuery(text: string): { locationQuery?: string } | nu
   }
 
   const prefixCityMatch =
-    /^([a-zA-Z\s-]{2,30}?)\s+(?:ka|ki|ke|me|mein)?\s*(?:current\s+|today'?s?\s+)?(?:weather|forecast|temperature|mausam|mosam)(?:\s+(?:kaisa\s+hai|kya\s+hai|today|now))?$/i.exec(
+    /^([\p{L}\p{N}\s'-]{2,35}?)\s+(?:ka|ki|ke|me|mein)?\s*(?:current\s+|today'?s?\s+)?(?:weather|forecast|temperature|mausam|mosam)(?:\s+(?:kaisa\s+hai|kya\s+hai|today|now))?$/iu.exec(
       lower,
     );
 
@@ -145,6 +161,36 @@ async function geocodeLocation(query: string): Promise<GeoResult | null> {
   return data.results?.[0] ?? null;
 }
 
+export async function resolveDateTimeToolData(options: {
+  locationQuery?: string;
+  clientTimeZone?: string;
+}) {
+  if (!options.locationQuery) {
+    const tz = isValidTimeZone(options.clientTimeZone) ? options.clientTimeZone : 'UTC';
+    return { ok: true as const, ...buildStructuredDateTime(tz) };
+  }
+
+  try {
+    const geo = await geocodeLocation(options.locationQuery);
+    if (!geo || !isValidTimeZone(geo.timezone)) {
+      return {
+        ok: false as const,
+        error: `Could not resolve timezone for "${options.locationQuery}".`,
+      };
+    }
+    const label = geo.country && geo.country !== geo.name ? `${geo.name}, ${geo.country}` : geo.name;
+    return {
+      ok: true as const,
+      ...buildStructuredDateTime(geo.timezone, label),
+    };
+  } catch {
+    return {
+      ok: false as const,
+      error: `Unable to look up timezone for "${options.locationQuery}".`,
+    };
+  }
+}
+
 export async function resolveDynamicDateTimeReply(options: {
   kind: 'date' | 'time' | 'datetime';
   locationQuery?: string;
@@ -184,26 +230,28 @@ function inferCityFromTimeZone(tz?: string): string | undefined {
   return cityPart.replace(/_/g, ' ');
 }
 
-export async function fetchLiveWeatherReply(options: {
+export async function fetchLiveWeatherData(options: {
   locationQuery?: string;
   clientTimeZone?: string;
-  preferUrdu: boolean;
-}): Promise<string> {
+}): Promise<{ ok: true; data: LiveWeatherData } | { ok: false; error: string; target?: string }> {
   const targetLocation =
     options.locationQuery || inferCityFromTimeZone(options.clientTimeZone);
 
   if (!targetLocation) {
-    return options.preferUrdu
-      ? 'Barah-e-karam shehar ka naam batayein (maslan "Karachi ka mausam") taake main aap ko live weather bata sakoon.'
-      : 'Please specify a city or location (for example, "weather in Karachi") so I can fetch live weather data.';
+    return {
+      ok: false,
+      error: 'No city or location was specified.',
+    };
   }
 
   try {
     const geo = await geocodeLocation(targetLocation);
     if (!geo) {
-      return options.preferUrdu
-        ? `Maaf kijiye, "${targetLocation}" ke liye live weather data nahi mil saka. Barah-e-karam kisi mashhoor shehar ka naam dobara check karein.`
-        : `I couldn't find live weather data for "${targetLocation}". Please check the city name and try again.`;
+      return {
+        ok: false,
+        target: targetLocation,
+        error: `Location "${targetLocation}" was not found.`,
+      };
     }
 
     const forecastUrl =
@@ -213,7 +261,11 @@ export async function fetchLiveWeatherReply(options: {
 
     const wx = await fetchJsonWithTimeout<OpenMeteoForecastResponse>(forecastUrl);
     if (!wx.current || typeof wx.current.temperature_2m !== 'number') {
-      throw new Error('WEATHER_DATA_MISSING');
+      return {
+        ok: false,
+        target: targetLocation,
+        error: 'Live weather fields were unavailable from the weather provider.',
+      };
     }
 
     const tz = isValidTimeZone(wx.timezone)
@@ -222,80 +274,102 @@ export async function fetchLiveWeatherReply(options: {
         ? geo.timezone
         : 'UTC';
 
-    const now = new Date();
-    const dateStr = new Intl.DateTimeFormat('en-US', {
-      timeZone: tz,
-      weekday: 'long',
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric',
-    }).format(now);
-    const timeStr = new Intl.DateTimeFormat('en-US', {
-      timeZone: tz,
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true,
-      timeZoneName: 'short',
-    }).format(now);
-
+    const { date, time: localTime } = buildStructuredDateTime(tz);
     const locationLabel =
       geo.country && geo.country !== geo.name ? `${geo.name}, ${geo.country}` : geo.name;
-    const tempC = Math.round(wx.current.temperature_2m);
-    const feelsC =
-      typeof wx.current.apparent_temperature === 'number'
-        ? Math.round(wx.current.apparent_temperature)
-        : undefined;
-    const humidity = wx.current.relative_humidity_2m;
-    const wind =
-      typeof wx.current.wind_speed_10m === 'number'
-        ? Math.round(wx.current.wind_speed_10m)
-        : undefined;
-    const highC =
-      typeof wx.daily?.temperature_2m_max?.[0] === 'number'
-        ? Math.round(wx.daily.temperature_2m_max[0])
-        : undefined;
-    const lowC =
-      typeof wx.daily?.temperature_2m_min?.[0] === 'number'
-        ? Math.round(wx.daily.temperature_2m_min[0])
-        : undefined;
-    const condition = describeWmoWeatherCode(wx.current.weather_code, options.preferUrdu);
 
-    if (options.preferUrdu) {
-      const lines = [
-        `**${locationLabel} ka Live Mausam** (${dateStr} · ${timeStr})`,
-        `- **Condition:** ${condition}`,
-        `- **Temperature:** ${tempC}°C${feelsC !== undefined ? ` (Feels like ${feelsC}°C)` : ''}`,
-      ];
-      if (highC !== undefined && lowC !== undefined) {
-        lines.push(`- **Aaj ka High / Low:** ${highC}°C / ${lowC}°C`);
-      }
-      if (typeof humidity === 'number') {
-        lines.push(`- **Humidity:** ${humidity}%`);
-      }
-      if (wind !== undefined) {
-        lines.push(`- **Hawa (Wind):** ${wind} km/h`);
-      }
-      return lines.join('\n');
+    return {
+      ok: true,
+      data: {
+        location: locationLabel,
+        timeZone: tz,
+        date,
+        localTime,
+        condition: describeWmoWeatherCode(wx.current.weather_code, false),
+        conditionUrdu: describeWmoWeatherCode(wx.current.weather_code, true),
+        temperatureC: Math.round(wx.current.temperature_2m),
+        feelsLikeC:
+          typeof wx.current.apparent_temperature === 'number'
+            ? Math.round(wx.current.apparent_temperature)
+            : undefined,
+        highC:
+          typeof wx.daily?.temperature_2m_max?.[0] === 'number'
+            ? Math.round(wx.daily.temperature_2m_max[0])
+            : undefined,
+        lowC:
+          typeof wx.daily?.temperature_2m_min?.[0] === 'number'
+            ? Math.round(wx.daily.temperature_2m_min[0])
+            : undefined,
+        humidityPercent: wx.current.relative_humidity_2m,
+        windSpeedKmh:
+          typeof wx.current.wind_speed_10m === 'number'
+            ? Math.round(wx.current.wind_speed_10m)
+            : undefined,
+      },
+    };
+  } catch {
+    return {
+      ok: false,
+      target: targetLocation,
+      error: `Unable to retrieve live weather data for "${targetLocation}" right now.`,
+    };
+  }
+}
+
+export async function fetchLiveWeatherReply(options: {
+  locationQuery?: string;
+  clientTimeZone?: string;
+  preferUrdu: boolean;
+}): Promise<string> {
+  const result = await fetchLiveWeatherData({
+    locationQuery: options.locationQuery,
+    clientTimeZone: options.clientTimeZone,
+  });
+
+  if (!result.ok) {
+    if (!result.target) {
+      return options.preferUrdu
+        ? 'Barah-e-karam shehar ka naam batayein (maslan "Karachi ka mausam") taake main aap ko live weather bata sakoon.'
+        : 'Please specify a city or location (for example, "weather in Karachi") so I can fetch live weather data.';
     }
+    return options.preferUrdu
+      ? `Is waqt **${result.target}** ka live weather data haasil nahi ho saka. Barah-e-karam kuch dair baad dobara koshish karein.`
+      : `Live weather data for **${result.target}** is temporarily unavailable right now. Please try again in a moment.`;
+  }
 
+  const d = result.data;
+
+  if (options.preferUrdu) {
     const lines = [
-      `**Current Weather in ${locationLabel}** (${dateStr} · ${timeStr})`,
-      `- **Condition:** ${condition}`,
-      `- **Temperature:** ${tempC}°C${feelsC !== undefined ? ` (Feels like ${feelsC}°C)` : ''}`,
+      `**${d.location} ka Live Mausam** (${d.date} · ${d.localTime})`,
+      `- **Condition:** ${d.conditionUrdu}`,
+      `- **Temperature:** ${d.temperatureC}°C${d.feelsLikeC !== undefined ? ` (Feels like ${d.feelsLikeC}°C)` : ''}`,
     ];
-    if (highC !== undefined && lowC !== undefined) {
-      lines.push(`- **Today's High / Low:** ${highC}°C / ${lowC}°C`);
+    if (d.highC !== undefined && d.lowC !== undefined) {
+      lines.push(`- **Aaj ka High / Low:** ${d.highC}°C / ${d.lowC}°C`);
     }
-    if (typeof humidity === 'number') {
-      lines.push(`- **Humidity:** ${humidity}%`);
+    if (typeof d.humidityPercent === 'number') {
+      lines.push(`- **Humidity:** ${d.humidityPercent}%`);
     }
-    if (wind !== undefined) {
-      lines.push(`- **Wind:** ${wind} km/h`);
+    if (d.windSpeedKmh !== undefined) {
+      lines.push(`- **Hawa (Wind):** ${d.windSpeedKmh} km/h`);
     }
     return lines.join('\n');
-  } catch {
-    return options.preferUrdu
-      ? `Is waqt **${targetLocation}** ka live weather data haasil nahi ho saka. Barah-e-karam kuch dair baad dobara koshish karein.`
-      : `Live weather data for **${targetLocation}** is temporarily unavailable right now. Please try again in a moment.`;
   }
+
+  const lines = [
+    `**Current Weather in ${d.location}** (${d.date} · ${d.localTime})`,
+    `- **Condition:** ${d.condition}`,
+    `- **Temperature:** ${d.temperatureC}°C${d.feelsLikeC !== undefined ? ` (Feels like ${d.feelsLikeC}°C)` : ''}`,
+  ];
+  if (d.highC !== undefined && d.lowC !== undefined) {
+    lines.push(`- **Today's High / Low:** ${d.highC}°C / ${d.lowC}°C`);
+  }
+  if (typeof d.humidityPercent === 'number') {
+    lines.push(`- **Humidity:** ${d.humidityPercent}%`);
+  }
+  if (d.windSpeedKmh !== undefined) {
+    lines.push(`- **Wind:** ${d.windSpeedKmh} km/h`);
+  }
+  return lines.join('\n');
 }

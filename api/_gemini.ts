@@ -1,6 +1,14 @@
 import dotenv from 'dotenv';
 import type { IncomingMessage as HttpIncomingMessage, ServerResponse } from 'http';
-import { GoogleGenAI, Content, Part, ThinkingLevel } from '@google/genai';
+import {
+  Content,
+  FunctionCall,
+  FunctionDeclaration,
+  GoogleGenAI,
+  Part,
+  ThinkingLevel,
+  Type,
+} from '@google/genai';
 import {
   ConversationLanguage,
   isUrduScript,
@@ -9,8 +17,10 @@ import {
 } from '../src/lib/quickReplies.js';
 import { isValidTimeZone, parseDateTimeQuery } from '../src/lib/dateTimeHelper.js';
 import {
+  fetchLiveWeatherData,
   fetchLiveWeatherReply,
   parseWeatherQuery,
+  resolveDateTimeToolData,
   resolveDynamicDateTimeReply,
 } from './_weather.js';
 
@@ -20,10 +30,10 @@ dotenv.config({ path: '.env' });
 
 const PRIMARY_MODEL = 'gemini-3.1-flash-lite';
 const FALLBACK_FREE_MODEL = 'gemini-4-hydrogen';
-const MAX_SERVER_RETRIES = 1;
+const MAX_SERVER_RETRIES = 2;
 const MAX_AUTO_RETRY_DELAY_MS = 1000;
-const UPSTREAM_CONNECT_TIMEOUT_MS = 14000;
-const STREAM_IDLE_TIMEOUT_MS = 14000;
+const UPSTREAM_CONNECT_TIMEOUT_MS = 16000;
+const STREAM_IDLE_TIMEOUT_MS = 16000;
 const MAX_BODY_BYTES = 6 * 1024 * 1024;
 
 interface IncomingImage {
@@ -53,6 +63,84 @@ export interface ParsedApiError {
   retryAfterSeconds?: number;
 }
 
+const LIVE_TOOL_DECLARATIONS: FunctionDeclaration[] = [
+  {
+    name: 'get_current_date',
+    description:
+      'Get the accurate real-time current date (and day of week) for the user timezone or a requested city.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        location: {
+          type: Type.STRING,
+          description: 'Optional city name such as Karachi, Lahore, London, or Tokyo.',
+        },
+      },
+    },
+  },
+  {
+    name: 'get_current_time',
+    description:
+      'Get the accurate real-time local clock time and timezone for the user or a requested city.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        location: {
+          type: Type.STRING,
+          description: 'Optional city name such as Karachi, Dubai, or New York.',
+        },
+      },
+    },
+  },
+  {
+    name: 'get_live_weather',
+    description:
+      'Fetch real-time live weather conditions, temperature, feels-like, high/low, humidity, and wind speed for a city.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        location: {
+          type: Type.STRING,
+          description: 'The city or location name, e.g. Karachi, Lahore, Islamabad, London.',
+        },
+      },
+      required: ['location'],
+    },
+  },
+];
+
+function shouldEnableLiveTools(messages: ChatMessageInput[]): boolean {
+  const combined = messages.map((m) => m.text).join(' ').toLowerCase();
+  return /\b(date|time|today|tomorrow|yesterday|day|year|month|weather|forecast|temperature|temp|rain|mausam|mosam|humidity|wind|climate|umbrella|jacket|hotter|colder|warmer|cooler|timezone|karachi|lahore|islamabad|dubai|london|2024|2025|2026|outdated|real-time|realtime|live)\b/i.test(
+    combined,
+  );
+}
+
+async function executeLiveToolCall(
+  call: FunctionCall,
+  clientTimeZone?: string,
+): Promise<Record<string, unknown>> {
+  const args = (call.args ?? {}) as { location?: unknown };
+  const locationQuery =
+    typeof args.location === 'string' && args.location.trim().length > 0
+      ? args.location.trim()
+      : undefined;
+
+  if (call.name === 'get_current_date' || call.name === 'get_current_time') {
+    return await resolveDateTimeToolData({ locationQuery, clientTimeZone });
+  }
+
+  if (call.name === 'get_live_weather') {
+    const wx = await fetchLiveWeatherData({ locationQuery, clientTimeZone });
+    if (!wx.ok) {
+      return { ok: false, error: wx.error };
+    }
+    return { ok: true, ...wx.data };
+  }
+
+  return { ok: false, error: `Unknown tool: ${call.name ?? 'unspecified'}` };
+}
+
 function buildSystemInstruction(
   language: ConversationLanguage,
   latestText: string,
@@ -67,7 +155,11 @@ function buildSystemInstruction(
     month: 'long',
     day: 'numeric',
   }).format(new Date());
-  const dateContext = `Today is ${todayStr} (${tz}). Keep answers short and direct for simple questions.`;
+  const dateContext =
+    `AUTHORITATIVE REAL-TIME DATE: Today is ${todayStr} (${tz}). ` +
+    `Never use outdated training-data dates or contradict this date. ` +
+    `Never invent weather conditions, temperatures, or dates; call get_current_date, get_current_time, or get_live_weather when live data is needed, and if a weather tool fails, clearly tell the user live weather data is unavailable. ` +
+    `Keep answers short and direct for simple questions.`;
   const imageHint = hasImage ? ' Inspect the image carefully to answer or extract text.' : '';
   if (isUrduScript(latestText)) {
     return `${dateContext} Reply concisely in Urdu script.${imageHint}`;
@@ -425,13 +517,17 @@ async function nextChunkWithTimeout<T>(
   });
 }
 
-async function openStreamWithFirstChunk(
+async function streamWithOptionalTools(
   ai: GoogleGenAI,
   model: string,
   contents: Content[],
   systemInstruction: string,
   signal: AbortSignal,
+  includeToolsConfig: boolean,
 ) {
+  const thinkingLevel =
+    model === 'gemini-3.1-flash-lite' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW;
+
   const timeoutController = new AbortController();
   let timedOut = false;
   const timeoutId = setTimeout(() => {
@@ -442,9 +538,6 @@ async function openStreamWithFirstChunk(
   const onParentAbort = () => timeoutController.abort();
   signal.addEventListener('abort', onParentAbort, { once: true });
 
-  const thinkingLevel =
-    model === 'gemini-3.1-flash-lite' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW;
-
   let stream: Awaited<ReturnType<typeof ai.models.generateContentStream>>;
   try {
     stream = await ai.models.generateContentStream({
@@ -454,6 +547,9 @@ async function openStreamWithFirstChunk(
         abortSignal: timeoutController.signal,
         thinkingConfig: { thinkingLevel },
         systemInstruction,
+        ...(includeToolsConfig
+          ? { tools: [{ functionDeclarations: LIVE_TOOL_DECLARATIONS }] }
+          : {}),
       },
     });
   } catch (err) {
@@ -479,13 +575,152 @@ async function openStreamWithFirstChunk(
   }
 }
 
+async function openStreamWithFirstChunk(
+  ai: GoogleGenAI,
+  model: string,
+  contents: Content[],
+  systemInstruction: string,
+  signal: AbortSignal,
+  enableTools: boolean,
+  clientTimeZone?: string,
+) {
+  if (!enableTools) {
+    return await streamWithOptionalTools(
+      ai,
+      model,
+      contents,
+      systemInstruction,
+      signal,
+      false,
+    );
+  }
+
+  const thinkingLevel =
+    model === 'gemini-3.1-flash-lite' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW;
+  const workingContents: Content[] = [...contents];
+
+  const timeoutController = new AbortController();
+  let timedOut = false;
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    timeoutController.abort();
+  }, UPSTREAM_CONNECT_TIMEOUT_MS);
+
+  const onParentAbort = () => timeoutController.abort();
+  signal.addEventListener('abort', onParentAbort, { once: true });
+
+  let response;
+  try {
+    response = await ai.models.generateContent({
+      model,
+      contents: workingContents,
+      config: {
+        abortSignal: timeoutController.signal,
+        thinkingConfig: { thinkingLevel },
+        systemInstruction,
+        tools: [{ functionDeclarations: LIVE_TOOL_DECLARATIONS }],
+      },
+    });
+  } catch (err) {
+    if (timedOut) {
+      throw new Error('UPSTREAM_TIMEOUT');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+    signal.removeEventListener('abort', onParentAbort);
+  }
+
+  const calls = response.functionCalls;
+  const previousContent = response.candidates?.[0]?.content;
+
+  if (calls && calls.length > 0 && previousContent) {
+    const toolResults = await Promise.all(
+      calls.map((fc) => executeLiveToolCall(fc, clientTimeZone)),
+    );
+    const responseParts: Part[] = calls.map((fc, idx) => ({
+      functionResponse: {
+        ...(fc.id ? { id: fc.id } : {}),
+        name: fc.name ?? 'unknown_tool',
+        response: { result: toolResults[idx] },
+      },
+    }));
+    workingContents.push(previousContent);
+    workingContents.push({ role: 'user', parts: responseParts });
+
+    // Stream final answer immediately using generateContentStream
+    return await streamWithOptionalTools(
+      ai,
+      model,
+      workingContents,
+      systemInstruction,
+      signal,
+      true,
+    );
+  }
+
+  const directText = response.text;
+  if (directText && directText.trim().length > 0) {
+    async function* singleChunk(): AsyncGenerator<{ text?: string }> {
+      // Already emitted as firstText
+    }
+    return {
+      iterator: singleChunk()[Symbol.asyncIterator](),
+      firstText: directText,
+      model,
+    };
+  }
+
+  return await streamWithOptionalTools(
+    ai,
+    model,
+    workingContents,
+    systemInstruction,
+    signal,
+    false,
+  );
+}
+
+async function buildGroundedFallbackInstruction(
+  contents: Content[],
+  baseInstruction: string,
+  clientTimeZone?: string,
+): Promise<string> {
+  const userTexts = contents
+    .filter((c) => c.role === 'user')
+    .map((c) => c.parts?.map((p) => p.text ?? '').join(' ') ?? '')
+    .join(' ');
+  const cityMatches = Array.from(
+    userTexts.matchAll(
+      /\b(karachi|lahore|islamabad|rawalpindi|faisalabad|multan|peshawar|quetta|dubai|abu dhabi|riyadh|jeddah|london|new york|los angeles|toronto|tokyo|istanbul|paris|berlin|delhi|mumbai|dhaka|singapore|sydney)\b/gi,
+    ),
+  ).map((m) => m[1]);
+  const uniqueCities = Array.from(new Set(cityMatches)).slice(0, 3);
+  if (uniqueCities.length === 0) {
+    return baseInstruction;
+  }
+  const weatherFacts = await Promise.all(
+    uniqueCities.map(async (city) => {
+      const res = await fetchLiveWeatherData({ locationQuery: city, clientTimeZone });
+      return res.ok
+        ? `${res.data.location} (${res.data.date} ${res.data.localTime}): ${res.data.condition}, ${res.data.temperatureC}°C (feels like ${res.data.feelsLikeC ?? res.data.temperatureC}°C), high/low ${res.data.highC ?? '-'}°C/${res.data.lowC ?? '-'}°C, humidity ${res.data.humidityPercent ?? '-'}%, wind ${res.data.windSpeedKmh ?? '-'} km/h.`
+        : `${city}: live weather unavailable (${res.error}).`;
+    }),
+  );
+  return `${baseInstruction} LIVE VERIFIED WEATHER DATA: ${weatherFacts.join(' | ')}`;
+}
+
 async function createStreamWithSmartRetry(
   ai: GoogleGenAI,
   contents: Content[],
   systemInstruction: string,
   signal: AbortSignal,
+  enableTools: boolean,
+  clientTimeZone?: string,
 ) {
   let activeModel = PRIMARY_MODEL;
+  let useTools = enableTools;
+  let activeInstruction = systemInstruction;
   let lastError: unknown;
 
   for (let attempt = 0; attempt <= MAX_SERVER_RETRIES; attempt++) {
@@ -498,8 +733,10 @@ async function createStreamWithSmartRetry(
         ai,
         activeModel,
         contents,
-        systemInstruction,
+        activeInstruction,
         signal,
+        useTools,
+        clientTimeZone,
       );
     } catch (err) {
       lastError = err;
@@ -513,6 +750,14 @@ async function createStreamWithSmartRetry(
         (err.message === 'UPSTREAM_TIMEOUT' || err.message === 'EMPTY_UPSTREAM_RESPONSE')
       ) {
         if (attempt < MAX_SERVER_RETRIES) {
+          if (useTools) {
+            useTools = false;
+            activeInstruction = await buildGroundedFallbackInstruction(
+              contents,
+              systemInstruction,
+              clientTimeZone,
+            );
+          }
           continue;
         }
         throw err;
@@ -529,13 +774,26 @@ async function createStreamWithSmartRetry(
           ai,
           activeModel,
           contents,
-          systemInstruction,
+          activeInstruction,
           signal,
+          useTools,
+          clientTimeZone,
         );
       }
 
       if (!parsed.retryable || attempt === MAX_SERVER_RETRIES) {
         throw lastError;
+      }
+
+      if (useTools && parsed.code === 'UPSTREAM_ERROR') {
+        useTools = false;
+        activeInstruction = await buildGroundedFallbackInstruction(
+          contents,
+          systemInstruction,
+          clientTimeZone,
+        );
+        await sleep(250, signal);
+        continue;
       }
 
       const requestedDelayMs = parsed.retryAfterSeconds
@@ -765,12 +1023,16 @@ export async function handleChatRequest(
   );
   const startMs = Date.now();
 
+  const enableTools = shouldEnableLiveTools(sanitized);
+
   try {
     const { iterator, firstText, model } = await createStreamWithSmartRetry(
       ai,
       contents,
       systemInstruction,
       controller.signal,
+      enableTools,
+      clientTimeZone,
     );
 
     res.statusCode = 200;
