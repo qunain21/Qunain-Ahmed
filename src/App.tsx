@@ -1,12 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Menu, MessageSquarePlus, RefreshCw, AlertCircle } from 'lucide-react';
-import { ChatErrorState, ChatImage, ChatMessage, Conversation, ThemeMode } from './types/chat';
 import {
+  ChatErrorState,
+  ChatImage,
+  ChatMessage,
+  Conversation,
+  GeneratedImageRecord,
+  ImageAspectRatio,
+  ThemeMode,
+} from './types/chat';
+import {
+  addGeneratedImageRecord,
   createConversationRecord,
   deleteConversationInList,
+  deleteGeneratedImageRecord,
   generateId,
   loadActiveConversationId,
   loadConversations,
+  loadGeneratedImages,
   loadTheme,
   renameConversationInList,
   saveActiveConversationId,
@@ -14,34 +25,45 @@ import {
   saveTheme,
   upsertConversationMessages,
 } from './lib/storage';
-import { ImageValidationError, processImageFile } from './lib/imageUtils';
+import {
+  ImageValidationError,
+  optimizeDataUrlForStorage,
+  processImageFile,
+} from './lib/imageUtils';
 import {
   ChatApiError,
   looksLikeHtmlPage,
   streamChatCompletion,
 } from './lib/chatApi';
+import {
+  extractImagePromptIntent,
+  fetchImageHealthInfo,
+  generateAiImage,
+  ImageHealthInfo,
+} from './lib/imageGenApi';
 import { ConversationLanguage, matchInstantReply } from './lib/quickReplies';
 import { Sidebar } from './components/Sidebar';
 import { ChatBubble } from './components/ChatBubble';
 import { ChatInput } from './components/ChatInput';
 import { ConfirmDialog } from './components/ConfirmDialog';
+import { ImageGalleryView } from './components/ImageGalleryView';
 
 const STARTER_PROMPTS = [
   {
-    title: 'Explain a concept clearly',
-    prompt: 'Explain how browser Local Storage works and when to use it.',
+    title: 'Generate an AI image',
+    prompt: '/imagine Minimalist ceramic coffee cup on warm oak table, soft morning window light',
   },
   {
-    title: 'Draft a quick message',
-    prompt: 'Help me write a concise, polite follow-up email after a project meeting.',
+    title: 'Explain a concept clearly',
+    prompt: 'Explain how browser Local Storage works and when to use it.',
   },
   {
     title: 'Debug or write code',
     prompt: 'Write a clean TypeScript debounce function with proper types.',
   },
   {
-    title: 'Summarize pros and cons',
-    prompt: 'Compare static site generation vs server-side rendering in 5 bullet points.',
+    title: 'Check live weather',
+    prompt: 'What is the current weather in Karachi right now?',
   },
 ];
 
@@ -66,7 +88,14 @@ export default function App() {
   const [activeId, setActiveId] = useState<string | null>(initialState.activeId);
   const [theme, setTheme] = useState<ThemeMode>(() => loadTheme());
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [activeView, setActiveView] = useState<'chat' | 'gallery'>('chat');
   const [inputValue, setInputValue] = useState('');
+  const [imageMode, setImageMode] = useState(false);
+  const [aspectRatio, setAspectRatio] = useState<ImageAspectRatio>('1:1');
+  const [generatedImages, setGeneratedImages] = useState<GeneratedImageRecord[]>(() =>
+    loadGeneratedImages(),
+  );
+  const [imageHealthInfo, setImageHealthInfo] = useState<ImageHealthInfo | null>(null);
   const [pendingImage, setPendingImage] = useState<ChatImage | null>(null);
   const [isProcessingImage, setIsProcessingImage] = useState(false);
   const [imageError, setImageError] = useState<string | null>(null);
@@ -81,6 +110,12 @@ export default function App() {
   const inputValueRef = useRef(inputValue);
   inputValueRef.current = inputValue;
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    void fetchImageHealthInfo().then((info) => {
+      if (info) setImageHealthInfo(info);
+    });
+  }, []);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -134,6 +169,7 @@ export default function App() {
     if (isGenerating) {
       handleStopGenerating();
     }
+    setActiveView('chat');
     setErrorState(null);
     setRetryCountdown(0);
     setImageError(null);
@@ -160,6 +196,7 @@ export default function App() {
 
   const handleSelectConversation = useCallback(
     (id: string) => {
+      setActiveView('chat');
       if (id === activeId) return;
       if (isGenerating) {
         handleStopGenerating();
@@ -389,6 +426,154 @@ export default function App() {
     [],
   );
 
+  const runImageGenerationTurn = useCallback(
+    async (
+      targetConvId: string,
+      historyWithUser: ChatMessage[],
+      imagePrompt: string,
+      ratio: ImageAspectRatio,
+      firstPromptMeta?: { text: string; imageName?: string },
+    ) => {
+      if (isSubmittingRef.current) return;
+      isSubmittingRef.current = true;
+      setErrorState(null);
+      setRetryCountdown(0);
+      setIsGenerating(true);
+
+      const assistantMsg: ChatMessage = {
+        id: generateId(),
+        role: 'model',
+        text: '',
+        kind: 'image_generation',
+        createdAt: Date.now(),
+      };
+      setStreamingMsgId(assistantMsg.id);
+
+      const withPlaceholder = [...historyWithUser, assistantMsg];
+      setConversations((prev) => {
+        const { conversations: next } = upsertConversationMessages(
+          prev,
+          targetConvId,
+          withPlaceholder,
+          firstPromptMeta,
+        );
+        return next;
+      });
+
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+
+      try {
+        const result = await generateAiImage({
+          prompt: imagePrompt,
+          aspectRatio: ratio,
+          signal: controller.signal,
+        });
+
+        const optimized = await optimizeDataUrlForStorage(
+          result.dataUrl,
+          result.mimeType,
+        );
+
+        const completedAssistantMsg: ChatMessage = {
+          ...assistantMsg,
+          text: `Generated image for: "${imagePrompt}"`,
+          kind: 'image_generation',
+          image: {
+            dataUrl: optimized.dataUrl,
+            mimeType: optimized.mimeType,
+            name: imagePrompt.slice(0, 48),
+            sizeBytes: optimized.sizeBytes,
+          },
+          generatedImage: {
+            prompt: imagePrompt,
+            provider: result.provider,
+            aspectRatio: result.aspectRatio,
+            width: result.width,
+            height: result.height,
+            usageLimitNote: result.usageLimitNote,
+          },
+        };
+
+        let storageWarning: string | undefined;
+        setConversations((prev) => {
+          const target = prev.find((c) => c.id === targetConvId);
+          if (!target) return prev;
+          const updatedMsgs = target.messages.map((msg) =>
+            msg.id === assistantMsg.id ? completedAssistantMsg : msg,
+          );
+          const { conversations: next, saveResult } = upsertConversationMessages(
+            prev,
+            targetConvId,
+            updatedMsgs,
+          );
+          if (!saveResult.ok && saveResult.error) {
+            storageWarning = saveResult.error;
+          }
+          return next;
+        });
+
+        const galleryRecord: GeneratedImageRecord = {
+          id: assistantMsg.id,
+          prompt: imagePrompt,
+          dataUrl: optimized.dataUrl,
+          mimeType: optimized.mimeType,
+          width: result.width,
+          height: result.height,
+          aspectRatio: result.aspectRatio,
+          provider: result.provider,
+          usageLimitNote: result.usageLimitNote,
+          createdAt: Date.now(),
+        };
+
+        setGeneratedImages((prev) => {
+          const { items, saveResult } = addGeneratedImageRecord(prev, galleryRecord);
+          if (!saveResult.ok && saveResult.error && !storageWarning) {
+            storageWarning = saveResult.error;
+          }
+          return items;
+        });
+
+        if (storageWarning) {
+          setErrorState({ message: storageWarning, retryable: false });
+        }
+      } catch (err) {
+        const isAbort =
+          (err instanceof DOMException || err instanceof Error) && err.name === 'AbortError';
+
+        setConversations((prev) => {
+          const target = prev.find((c) => c.id === targetConvId);
+          if (!target) return prev;
+          const withoutPlaceholder = target.messages.filter(
+            (msg) => msg.id !== assistantMsg.id,
+          );
+          return upsertConversationMessages(prev, targetConvId, withoutPlaceholder)
+            .conversations;
+        });
+
+        if (!isAbort) {
+          const message =
+            err instanceof ChatApiError
+              ? err.message
+              : 'Unable to generate the image right now. Please try again.';
+          const code = err instanceof ChatApiError ? err.code : 'IMAGE_GEN_ERROR';
+          const retryable = err instanceof ChatApiError ? err.retryable : true;
+          const retryAfterSeconds =
+            err instanceof ChatApiError ? err.retryAfterSeconds : undefined;
+
+          setErrorState({ message, code, retryable, retryAfterSeconds });
+          setRetryCountdown(retryable && retryAfterSeconds ? retryAfterSeconds : 0);
+        }
+      } finally {
+        abortControllerRef.current = null;
+        isSubmittingRef.current = false;
+        setIsGenerating(false);
+        setStreamingMsgId(null);
+      }
+    },
+    [],
+  );
+
   const handleSendMessage = useCallback(
     (overrideText?: string) => {
       const textToSend = (overrideText ?? inputValueRef.current).trim();
@@ -409,15 +594,24 @@ export default function App() {
         setImageError(null);
       }
 
+      const detectedImagePrompt = !imageToSend
+        ? imageMode
+          ? textToSend
+          : extractImagePromptIntent(textToSend)
+        : null;
+      const isImageGenerationRequest =
+        detectedImagePrompt !== null && detectedImagePrompt.length >= 2;
+
       const currentLanguage: ConversationLanguage =
         activeConversation?.preferredLanguage ?? 'auto';
       const clientTimeZone =
         typeof Intl !== 'undefined'
           ? Intl.DateTimeFormat().resolvedOptions().timeZone
           : undefined;
-      const instantMatch = !imageToSend
-        ? matchInstantReply(textToSend, currentLanguage, clientTimeZone)
-        : null;
+      const instantMatch =
+        !imageToSend && !isImageGenerationRequest
+          ? matchInstantReply(textToSend, currentLanguage, clientTimeZone)
+          : null;
       const nextLanguage: ConversationLanguage =
         instantMatch?.nextLanguage ?? currentLanguage;
 
@@ -426,6 +620,16 @@ export default function App() {
         role: 'user',
         text: textToSend,
         image: imageToSend ?? undefined,
+        kind: isImageGenerationRequest ? 'image_generation' : 'text',
+        generatedImage: isImageGenerationRequest
+          ? {
+              prompt: detectedImagePrompt,
+              provider: imageHealthInfo?.providerLabel ?? 'AI Image Generator',
+              aspectRatio,
+              width: 768,
+              height: 768,
+            }
+          : undefined,
         createdAt: Date.now(),
       };
 
@@ -496,17 +700,29 @@ export default function App() {
         setRetryCountdown(0);
       }
 
-      if (!instantReplyMessage) {
+      if (isImageGenerationRequest && detectedImagePrompt) {
+        void runImageGenerationTurn(
+          targetId!,
+          nextMessages,
+          detectedImagePrompt,
+          aspectRatio,
+          firstPromptMeta,
+        );
+      } else if (!instantReplyMessage) {
         void runAssistantTurn(targetId!, nextMessages, firstPromptMeta, nextLanguage);
       }
     },
     [
       activeConversation,
       activeId,
+      aspectRatio,
+      imageHealthInfo?.providerLabel,
+      imageMode,
       isGenerating,
       isProcessingImage,
       pendingImage,
       runAssistantTurn,
+      runImageGenerationTurn,
     ],
   );
 
@@ -522,6 +738,28 @@ export default function App() {
   const handleSubmitCurrent = useCallback(() => handleSendMessage(), [handleSendMessage]);
   const handleRemoveImage = useCallback(() => setPendingImage(null), []);
   const handleClearImageError = useCallback(() => setImageError(null), []);
+  const handleToggleImageMode = useCallback(() => {
+    setImageMode((prev) => {
+      const next = !prev;
+      if (next) {
+        setPendingImage(null);
+        setImageError(null);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleReuseImagePrompt = useCallback((prompt: string) => {
+    setActiveView('chat');
+    setImageMode(true);
+    setPendingImage(null);
+    setImageError(null);
+    setInputValue(prompt);
+  }, []);
+
+  const handleDeleteGeneratedImage = useCallback((id: string) => {
+    setGeneratedImages((prev) => deleteGeneratedImageRecord(prev, id));
+  }, []);
 
   const handleRetryLast = useCallback(() => {
     if (
@@ -553,13 +791,36 @@ export default function App() {
       );
     }
 
+    const lastUserMsg = historyToSend[historyToSend.length - 1];
+    if (lastUserMsg.kind === 'image_generation') {
+      const retryPrompt =
+        lastUserMsg.generatedImage?.prompt ||
+        extractImagePromptIntent(lastUserMsg.text) ||
+        lastUserMsg.text;
+      const retryRatio = lastUserMsg.generatedImage?.aspectRatio ?? aspectRatio;
+      void runImageGenerationTurn(
+        activeConversation.id,
+        historyToSend,
+        retryPrompt,
+        retryRatio,
+      );
+      return;
+    }
+
     void runAssistantTurn(
       activeConversation.id,
       historyToSend,
       undefined,
       activeConversation.preferredLanguage ?? 'auto',
     );
-  }, [activeConversation, isGenerating, retryCountdown, runAssistantTurn]);
+  }, [
+    activeConversation,
+    aspectRatio,
+    isGenerating,
+    retryCountdown,
+    runAssistantTurn,
+    runImageGenerationTurn,
+  ]);
 
   const messages = activeConversation?.messages ?? [];
   const headerTitle = activeConversation?.title ?? 'New chat';
@@ -580,7 +841,7 @@ export default function App() {
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-[52px] shrink-0 items-center justify-between gap-4 border-b border-slate-200/80 bg-white/90 px-3 backdrop-blur-md sm:px-6 dark:border-slate-800 dark:bg-slate-950/90">
+        <header className="flex h-[52px] shrink-0 items-center justify-between gap-3 border-b border-slate-200/80 bg-white/90 px-3 backdrop-blur-md sm:px-6 dark:border-slate-800 dark:bg-slate-950/90">
           <div className="flex min-w-0 items-center gap-2">
             <button
               type="button"
@@ -591,13 +852,48 @@ export default function App() {
               <Menu className="h-5 w-5" aria-hidden="true" />
             </button>
             <h1 className="truncate font-display text-base font-semibold text-slate-900 dark:text-white">
-              {headerTitle}
+              {activeView === 'gallery' ? 'Image Gallery' : headerTitle}
             </h1>
           </div>
 
-          <div className="flex shrink-0 items-center gap-3">
-            {messages.length > 0 && (
-              <span className="hidden text-xs text-slate-500 tabular-nums sm:inline dark:text-slate-400">
+          <div className="flex shrink-0 items-center gap-2 sm:gap-3">
+            <div
+              className="flex items-center rounded-lg bg-slate-100 p-0.5 dark:bg-slate-900"
+              role="tablist"
+              aria-label="Workspace view"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeView === 'chat'}
+                onClick={() => setActiveView('chat')}
+                className={`min-h-[34px] rounded-md px-2.5 text-xs font-medium whitespace-nowrap transition-colors focus-visible:outline-2 focus-visible:outline-blue-600 sm:px-3 ${
+                  activeView === 'chat'
+                    ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-800 dark:text-white'
+                    : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'
+                }`}
+              >
+                Chat
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeView === 'gallery'}
+                onClick={() => setActiveView('gallery')}
+                className={`min-h-[34px] rounded-md px-2.5 text-xs font-medium whitespace-nowrap tabular-nums transition-colors focus-visible:outline-2 focus-visible:outline-blue-600 sm:px-3 ${
+                  activeView === 'gallery'
+                    ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-800 dark:text-white'
+                    : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'
+                }`}
+              >
+                {generatedImages.length > 0
+                  ? `Images (${generatedImages.length})`
+                  : 'Images'}
+              </button>
+            </div>
+
+            {activeView === 'chat' && messages.length > 0 && (
+              <span className="hidden text-xs text-slate-500 tabular-nums md:inline dark:text-slate-400">
                 {messages.length} {messages.length === 1 ? 'message' : 'messages'}
               </span>
             )}
@@ -613,15 +909,23 @@ export default function App() {
         </header>
 
         <main className="flex-1 overflow-y-auto px-3 py-5 sm:px-6 sm:py-8">
-          <div className="mx-auto flex w-full max-w-3xl flex-col gap-5">
-            {messages.length === 0 ? (
-              <section className="flex min-h-[55dvh] flex-col items-center justify-center py-6 text-center">
-                <h2 className="font-display text-2xl font-semibold tracking-tight text-slate-900 sm:text-3xl dark:text-white">
-                  How can I help today?
-                </h2>
-                <p className="mt-2 max-w-md text-[15px] leading-relaxed text-slate-600 dark:text-slate-400">
-                  Ask a question, upload an image to analyze or extract text, or draft code. Conversations stay saved in your browser.
-                </p>
+          {activeView === 'gallery' ? (
+            <ImageGalleryView
+              images={generatedImages}
+              healthInfo={imageHealthInfo}
+              onReusePrompt={handleReuseImagePrompt}
+              onDeleteImage={handleDeleteGeneratedImage}
+            />
+          ) : (
+            <div className="mx-auto flex w-full max-w-3xl flex-col gap-5">
+              {messages.length === 0 ? (
+                <section className="flex min-h-[55dvh] flex-col items-center justify-center py-6 text-center">
+                  <h2 className="font-display text-2xl font-semibold tracking-tight text-slate-900 sm:text-3xl dark:text-white">
+                    How can I help today?
+                  </h2>
+                  <p className="mt-2 max-w-md text-[15px] leading-relaxed text-slate-600 dark:text-slate-400">
+                    Ask a question, upload an image to analyze, or generate custom AI images. Everything stays saved in your browser.
+                  </p>
 
                 <div className="mt-7 grid w-full max-w-2xl grid-cols-1 gap-2.5 sm:grid-cols-2">
                   {STARTER_PROMPTS.map((item) => (
@@ -679,23 +983,31 @@ export default function App() {
               </div>
             )}
 
-            <div ref={messagesEndRef} className="h-1" />
-          </div>
+              <div ref={messagesEndRef} className="h-1" />
+            </div>
+          )}
         </main>
 
-        <ChatInput
-          value={inputValue}
-          onChange={setInputValue}
-          onSubmit={handleSubmitCurrent}
-          onStop={handleStopGenerating}
-          isGenerating={isGenerating}
-          pendingImage={pendingImage}
-          isProcessingImage={isProcessingImage}
-          imageError={imageError}
-          onSelectImageFile={handleSelectImageFile}
-          onRemoveImage={handleRemoveImage}
-          onClearImageError={handleClearImageError}
-        />
+        {activeView === 'chat' && (
+          <ChatInput
+            value={inputValue}
+            onChange={setInputValue}
+            onSubmit={handleSubmitCurrent}
+            onStop={handleStopGenerating}
+            isGenerating={isGenerating}
+            pendingImage={pendingImage}
+            isProcessingImage={isProcessingImage}
+            imageError={imageError}
+            onSelectImageFile={handleSelectImageFile}
+            onRemoveImage={handleRemoveImage}
+            onClearImageError={handleClearImageError}
+            imageMode={imageMode}
+            onToggleImageMode={handleToggleImageMode}
+            aspectRatio={aspectRatio}
+            onChangeAspectRatio={setAspectRatio}
+            freeTierNote={imageHealthInfo?.freeTierNote}
+          />
+        )}
       </div>
 
       <ConfirmDialog

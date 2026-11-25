@@ -150,3 +150,84 @@ export async function processImageFile(file: File): Promise<ChatImage> {
     sizeBytes,
   };
 }
+
+export async function optimizeDataUrlForStorage(
+  dataUrl: string,
+  mimeType: string,
+): Promise<{ dataUrl: string; mimeType: string; sizeBytes: number }> {
+  const initialSize = estimateDataUrlBytes(dataUrl);
+  if (initialSize <= 320 * 1024) {
+    return { dataUrl, mimeType, sizeBytes: initialSize };
+  }
+
+  try {
+    const img = await loadImageElement(dataUrl);
+    let outputMime = 'image/webp';
+    let optimized = renderToDataUrl(img, 1024, outputMime, 0.86);
+    if (!optimized.startsWith('data:image/webp')) {
+      outputMime = 'image/jpeg';
+      optimized = renderToDataUrl(img, 1024, outputMime, 0.85);
+    }
+    let sizeBytes = estimateDataUrlBytes(optimized);
+    if (sizeBytes > 350 * 1024) {
+      optimized = renderToDataUrl(img, 896, 'image/jpeg', 0.78);
+      outputMime = 'image/jpeg';
+      sizeBytes = estimateDataUrlBytes(optimized);
+    }
+    return { dataUrl: optimized, mimeType: outputMime, sizeBytes };
+  } catch {
+    return { dataUrl, mimeType, sizeBytes: initialSize };
+  }
+}
+
+export function downloadDataUrlImage(
+  dataUrl: string,
+  promptOrName: string,
+  mimeType = 'image/png',
+): void {
+  const ext =
+    mimeType.includes('jpeg') || mimeType.includes('jpg')
+      ? 'jpg'
+      : mimeType.includes('webp')
+        ? 'webp'
+        : 'png';
+
+  const slug = promptOrName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 42);
+  const filename = `swiftchat-${slug || 'generated-image'}.${ext}`;
+
+  const link = document.createElement('a');
+  let objectUrl: string | null = null;
+
+  try {
+    const commaIdx = dataUrl.indexOf(',');
+    if (commaIdx !== -1) {
+      const base64 = dataUrl.slice(commaIdx + 1);
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      const blob = new Blob([bytes], { type: mimeType });
+      objectUrl = URL.createObjectURL(blob);
+      link.href = objectUrl;
+    } else {
+      link.href = dataUrl;
+    }
+  } catch {
+    link.href = dataUrl;
+  }
+
+  link.download = filename;
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+
+  if (objectUrl) {
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl!), 1500);
+  }
+}

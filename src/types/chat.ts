@@ -1,5 +1,7 @@
 export type ChatRole = 'user' | 'model';
 
+export type ImageAspectRatio = '1:1' | '16:9' | '9:16' | '4:3' | '3:4';
+
 export interface ChatImage {
   dataUrl: string;
   mimeType: string;
@@ -7,11 +9,35 @@ export interface ChatImage {
   sizeBytes: number;
 }
 
+export interface GeneratedImageMeta {
+  prompt: string;
+  provider: string;
+  aspectRatio: ImageAspectRatio;
+  width: number;
+  height: number;
+  usageLimitNote?: string;
+}
+
+export interface GeneratedImageRecord {
+  id: string;
+  prompt: string;
+  dataUrl: string;
+  mimeType: string;
+  width: number;
+  height: number;
+  aspectRatio: ImageAspectRatio;
+  provider: string;
+  usageLimitNote?: string;
+  createdAt: number;
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
   text: string;
   image?: ChatImage;
+  kind?: 'text' | 'image_generation';
+  generatedImage?: GeneratedImageMeta;
   createdAt: number;
 }
 

@@ -1,6 +1,7 @@
 import { memo, useEffect, useState } from 'react';
-import { Check, Copy, X } from 'lucide-react';
+import { Check, Copy, Download, Loader2, X } from 'lucide-react';
 import { ChatMessage } from '../types/chat';
+import { downloadDataUrlImage } from '../lib/imageUtils';
 import { MarkdownRenderer } from './MarkdownRenderer';
 
 interface ChatBubbleProps {
@@ -41,6 +42,13 @@ export const ChatBubble = memo(function ChatBubble({
     } catch {
       // Ignore clipboard failure
     }
+  };
+
+  const handleDownloadImage = () => {
+    if (!message.image) return;
+    const label =
+      message.generatedImage?.prompt || message.image.name || 'generated-image';
+    downloadDataUrlImage(message.image.dataUrl, label, message.image.mimeType);
   };
 
   if (isUser) {
@@ -112,63 +120,180 @@ export const ChatBubble = memo(function ChatBubble({
     );
   }
 
-  const isWaitingFirstChunk = isStreaming && message.text.length === 0;
+  const isWaitingImage =
+    isStreaming && message.kind === 'image_generation' && !message.image;
+  const isWaitingFirstChunk =
+    isStreaming && message.kind !== 'image_generation' && message.text.length === 0;
 
   return (
-    <div className="flex justify-start">
-      <div className="w-full max-w-[92%] sm:max-w-[82%]">
-        <div className="rounded-2xl rounded-bl-md border border-slate-200 bg-white px-4 py-3.5 text-slate-800 shadow-xs dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100">
-          {isWaitingFirstChunk ? (
-            <div
-              className="flex items-center gap-2.5 py-0.5 text-sm text-slate-500 dark:text-slate-400"
-              role="status"
-              aria-live="polite"
-            >
-              <span className="inline-flex items-center gap-1" aria-hidden="true">
-                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.24s] dark:bg-slate-500" />
-                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.12s] dark:bg-slate-500" />
-                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-slate-400 dark:bg-slate-500" />
-              </span>
-              <span>Thinking...</span>
-            </div>
-          ) : (
-            <MarkdownRenderer content={message.text} />
-          )}
-        </div>
+    <>
+      <div className="flex justify-start">
+        <div className="w-full max-w-[92%] sm:max-w-[82%]">
+          <div className="rounded-2xl rounded-bl-md border border-slate-200 bg-white px-4 py-3.5 text-slate-800 shadow-xs dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100">
+            {isWaitingImage ? (
+              <div
+                className="space-y-3"
+                role="status"
+                aria-live="polite"
+              >
+                <div className="flex aspect-square w-full max-w-[300px] flex-col items-center justify-center gap-2.5 rounded-xl border border-slate-200 bg-slate-50 p-4 text-center dark:border-slate-800 dark:bg-slate-950">
+                  <Loader2
+                    className="h-6 w-6 animate-spin text-blue-600 dark:text-blue-400"
+                    aria-hidden="true"
+                  />
+                  <span className="text-sm font-medium text-slate-700 dark:text-slate-200">
+                    Generating AI image...
+                  </span>
+                  <span className="text-xs text-slate-500 dark:text-slate-400">
+                    This usually takes a few seconds
+                  </span>
+                </div>
+              </div>
+            ) : isWaitingFirstChunk ? (
+              <div
+                className="flex items-center gap-2.5 py-0.5 text-sm text-slate-500 dark:text-slate-400"
+                role="status"
+                aria-live="polite"
+              >
+                <span className="inline-flex items-center gap-1" aria-hidden="true">
+                  <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.24s] dark:bg-slate-500" />
+                  <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-slate-400 [animation-delay:-0.12s] dark:bg-slate-500" />
+                  <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-slate-400 dark:bg-slate-500" />
+                </span>
+                <span>Thinking...</span>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {message.image && (
+                  <div className="space-y-2">
+                    <button
+                      type="button"
+                      onClick={() => setLightboxOpen(true)}
+                      aria-label={`View full size generated image: ${message.generatedImage?.prompt ?? message.image.name}`}
+                      className="block w-full max-w-[440px] overflow-hidden rounded-xl border border-slate-200 bg-slate-100 text-left transition-opacity hover:opacity-95 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 dark:border-slate-800 dark:bg-slate-950"
+                    >
+                      <img
+                        src={message.image.dataUrl}
+                        alt={message.generatedImage?.prompt || message.image.name || 'Generated AI image'}
+                        referrerPolicy="no-referrer"
+                        className="h-auto max-h-[420px] w-full object-contain"
+                      />
+                    </button>
+                    {message.generatedImage && (
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
+                        <span>{message.generatedImage.aspectRatio}</span>
+                        <span className="mx-1.5" aria-hidden="true">
+                          ·
+                        </span>
+                        <span>{message.generatedImage.provider}</span>
+                      </p>
+                    )}
+                  </div>
+                )}
 
-        <div className="mt-1.5 flex items-center justify-between gap-3 px-1">
-          <div className="flex items-center text-xs text-slate-500 tabular-nums dark:text-slate-400">
-            <span>Assistant</span>
-            <span className="mx-1.5" aria-hidden="true">
-              ·
-            </span>
-            <time dateTime={new Date(message.createdAt).toISOString()}>
-              {formatMessageTime(message.createdAt)}
-            </time>
+                {message.text.trim().length > 0 && (
+                  <MarkdownRenderer content={message.text} />
+                )}
+              </div>
+            )}
           </div>
 
-          {message.text.length > 0 && !isWaitingFirstChunk && (
-            <button
-              type="button"
-              onClick={handleCopy}
-              aria-label={copied ? 'Copied response' : 'Copy response'}
-              className="inline-flex min-h-[36px] min-w-[44px] items-center justify-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium text-slate-600 transition-colors hover:bg-slate-200/70 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
-            >
-              {copied ? (
-                <>
-                  <Check className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
-                  <span className="text-emerald-700 dark:text-emerald-400">Copied</span>
-                </>
-              ) : (
-                <>
-                  <Copy className="h-3.5 w-3.5" aria-hidden="true" />
-                  <span>Copy</span>
-                </>
+          <div className="mt-1.5 flex items-center justify-between gap-3 px-1">
+            <div className="flex items-center text-xs text-slate-500 tabular-nums dark:text-slate-400">
+              <span>Assistant</span>
+              <span className="mx-1.5" aria-hidden="true">
+                ·
+              </span>
+              <time dateTime={new Date(message.createdAt).toISOString()}>
+                {formatMessageTime(message.createdAt)}
+              </time>
+            </div>
+
+            <div className="flex items-center gap-1">
+              {message.image && !isWaitingImage && (
+                <button
+                  type="button"
+                  onClick={handleDownloadImage}
+                  aria-label="Download generated image"
+                  className="inline-flex min-h-[36px] min-w-[44px] items-center justify-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium text-slate-600 transition-colors hover:bg-slate-200/70 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
+                >
+                  <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span>Download</span>
+                </button>
               )}
-            </button>
-          )}
+
+              {message.text.length > 0 && !isWaitingFirstChunk && !isWaitingImage && (
+                <button
+                  type="button"
+                  onClick={handleCopy}
+                  aria-label={copied ? 'Copied response' : 'Copy response'}
+                  className="inline-flex min-h-[36px] min-w-[44px] items-center justify-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium text-slate-600 transition-colors hover:bg-slate-200/70 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
+                >
+                  {copied ? (
+                    <>
+                      <Check className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+                      <span className="text-emerald-700 dark:text-emerald-400">Copied</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="h-3.5 w-3.5" aria-hidden="true" />
+                      <span>Copy</span>
+                    </>
+                  )}
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       </div>
-    </div>
+
+      {lightboxOpen && message.image && (
+        <div
+          className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-4 bg-slate-950/90 p-4 backdrop-blur-xs"
+          role="dialog"
+          aria-modal="true"
+          aria-label={message.generatedImage?.prompt || message.image.name}
+          onClick={() => setLightboxOpen(false)}
+        >
+          <div className="fixed top-4 right-4 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleDownloadImage();
+              }}
+              aria-label="Download generated image"
+              className="inline-flex h-11 items-center gap-2 rounded-xl bg-blue-600 px-4 text-sm font-medium text-white transition-colors hover:bg-blue-700 focus-visible:outline-2 focus-visible:outline-white"
+            >
+              <Download className="h-4 w-4" aria-hidden="true" />
+              <span>Download</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setLightboxOpen(false)}
+              aria-label="Close image preview"
+              className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-900/80 text-white transition-colors hover:bg-slate-800 focus-visible:outline-2 focus-visible:outline-white"
+            >
+              <X className="h-5 w-5" aria-hidden="true" />
+            </button>
+          </div>
+          <img
+            src={message.image.dataUrl}
+            alt={message.generatedImage?.prompt || message.image.name || 'Generated image full view'}
+            referrerPolicy="no-referrer"
+            onClick={(e) => e.stopPropagation()}
+            className="max-h-[82dvh] max-w-full rounded-xl object-contain shadow-2xl"
+          />
+          {message.generatedImage?.prompt && (
+            <p
+              onClick={(e) => e.stopPropagation()}
+              className="max-w-2xl text-center text-sm text-slate-300"
+            >
+              {message.generatedImage.prompt}
+            </p>
+          )}
+        </div>
+      )}
+    </>
   );
 });

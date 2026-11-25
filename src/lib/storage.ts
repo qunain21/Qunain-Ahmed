@@ -1,6 +1,7 @@
-import { ChatMessage, Conversation, ThemeMode } from '../types/chat';
+import { ChatMessage, Conversation, GeneratedImageRecord, ThemeMode } from '../types/chat';
 
 const CONVERSATIONS_KEY = 'swiftchat_conversations_v1';
+const GENERATED_IMAGES_KEY = 'swiftchat_generated_images_v1';
 const ACTIVE_ID_KEY = 'swiftchat_active_id_v1';
 const THEME_KEY = 'swiftchat_theme_v1';
 
@@ -218,4 +219,64 @@ export function saveTheme(theme: ThemeMode): void {
   } catch {
     // Ignore
   }
+}
+
+export function loadGeneratedImages(): GeneratedImageRecord[] {
+  try {
+    const raw = window.localStorage.getItem(GENERATED_IMAGES_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (item): item is GeneratedImageRecord =>
+          typeof item === 'object' &&
+          item !== null &&
+          typeof item.id === 'string' &&
+          typeof item.prompt === 'string' &&
+          typeof item.dataUrl === 'string' &&
+          item.dataUrl.startsWith('data:image/') &&
+          typeof item.createdAt === 'number',
+      )
+      .sort((a, b) => b.createdAt - a.createdAt);
+  } catch {
+    return [];
+  }
+}
+
+export function saveGeneratedImages(items: GeneratedImageRecord[]): StorageSaveResult {
+  try {
+    window.localStorage.setItem(GENERATED_IMAGES_KEY, JSON.stringify(items));
+    return { ok: true };
+  } catch (err) {
+    const isQuota =
+      err instanceof DOMException &&
+      (err.name === 'QuotaExceededError' ||
+        err.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+        err.code === 22);
+    return {
+      ok: false,
+      error: isQuota
+        ? 'Browser Local Storage is full. Delete an older generated image or chat to save more.'
+        : 'Could not save generated image to browser Local Storage.',
+    };
+  }
+}
+
+export function addGeneratedImageRecord(
+  existing: GeneratedImageRecord[],
+  record: GeneratedImageRecord,
+): { items: GeneratedImageRecord[]; saveResult: StorageSaveResult } {
+  const next = [record, ...existing.filter((item) => item.id !== record.id)].slice(0, 24);
+  const saveResult = saveGeneratedImages(next);
+  return { items: next, saveResult };
+}
+
+export function deleteGeneratedImageRecord(
+  existing: GeneratedImageRecord[],
+  id: string,
+): GeneratedImageRecord[] {
+  const next = existing.filter((item) => item.id !== id);
+  saveGeneratedImages(next);
+  return next;
 }

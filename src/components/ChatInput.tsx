@@ -1,7 +1,9 @@
 import { memo, useEffect, useRef } from 'react';
-import { AlertCircle, ArrowUp, ImagePlus, Loader2, RefreshCw, Square, X } from 'lucide-react';
-import { ChatImage } from '../types/chat';
+import { AlertCircle, ArrowUp, ImagePlus, Loader2, Palette, RefreshCw, Square, X } from 'lucide-react';
+import { ChatImage, ImageAspectRatio } from '../types/chat';
 import { formatBytes } from '../lib/imageUtils';
+
+const ASPECT_OPTIONS: ImageAspectRatio[] = ['1:1', '16:9', '9:16', '4:3', '3:4'];
 
 interface ChatInputProps {
   value: string;
@@ -15,6 +17,11 @@ interface ChatInputProps {
   onSelectImageFile: (file: File) => void;
   onRemoveImage: () => void;
   onClearImageError: () => void;
+  imageMode: boolean;
+  onToggleImageMode: () => void;
+  aspectRatio: ImageAspectRatio;
+  onChangeAspectRatio: (ratio: ImageAspectRatio) => void;
+  freeTierNote?: string;
 }
 
 export const ChatInput = memo(function ChatInput({
@@ -29,6 +36,11 @@ export const ChatInput = memo(function ChatInput({
   onSelectImageFile,
   onRemoveImage,
   onClearImageError,
+  imageMode,
+  onToggleImageMode,
+  aspectRatio,
+  onChangeAspectRatio,
+  freeTierNote,
 }: ChatInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -41,10 +53,11 @@ export const ChatInput = memo(function ChatInput({
     el.style.height = `${Math.max(44, nextHeight)}px`;
   }, [value]);
 
-  const canSend =
-    (value.trim().length > 0 || pendingImage !== null) &&
-    !isGenerating &&
-    !isProcessingImage;
+  const canSend = imageMode
+    ? value.trim().length >= 2 && !isGenerating && !isProcessingImage
+    : (value.trim().length > 0 || pendingImage !== null) &&
+      !isGenerating &&
+      !isProcessingImage;
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -75,6 +88,7 @@ export const ChatInput = memo(function ChatInput({
   };
 
   const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    if (imageMode) return;
     const items = e.clipboardData?.items;
     if (!items) return;
     for (const item of items) {
@@ -130,7 +144,38 @@ export const ChatInput = memo(function ChatInput({
           onSubmit={handleFormSubmit}
           className="rounded-2xl border border-slate-200 bg-slate-50 p-1.5 transition-colors focus-within:border-blue-500 focus-within:bg-white dark:border-slate-800 dark:bg-slate-900 dark:focus-within:border-blue-500 dark:focus-within:bg-slate-900"
         >
-          {(isProcessingImage || pendingImage) && (
+          {imageMode && (
+            <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200/80 bg-white px-2.5 py-2 dark:border-slate-800 dark:bg-slate-950">
+              <div className="flex flex-wrap items-center gap-1">
+                <span className="mr-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
+                  Aspect ratio
+                </span>
+                {ASPECT_OPTIONS.map((ratio) => (
+                  <button
+                    key={ratio}
+                    type="button"
+                    onClick={() => onChangeAspectRatio(ratio)}
+                    disabled={isGenerating}
+                    aria-pressed={aspectRatio === ratio}
+                    className={`min-h-[32px] rounded-lg px-2.5 text-xs font-medium tabular-nums transition-colors focus-visible:outline-2 focus-visible:outline-blue-600 ${
+                      aspectRatio === ratio
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-slate-100 text-slate-700 hover:bg-slate-200 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800'
+                    }`}
+                  >
+                    {ratio}
+                  </button>
+                ))}
+              </div>
+              {freeTierNote && (
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  {freeTierNote}
+                </p>
+              )}
+            </div>
+          )}
+
+          {!imageMode && (isProcessingImage || pendingImage) && (
             <div className="mb-1.5 flex items-center justify-between gap-3 rounded-xl border border-slate-200/80 bg-white p-2 dark:border-slate-800 dark:bg-slate-950">
               {isProcessingImage ? (
                 <div className="flex items-center gap-2.5 px-1.5 py-2 text-xs font-medium text-slate-600 dark:text-slate-300">
@@ -184,19 +229,40 @@ export const ChatInput = memo(function ChatInput({
           )}
 
           <div className="flex items-end gap-1.5">
+            {!imageMode && (
+              <button
+                type="button"
+                onClick={openFilePicker}
+                disabled={isGenerating || isProcessingImage}
+                aria-label="Upload image"
+                title="Upload image (JPG, PNG, WEBP)"
+                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl text-slate-600 transition-colors hover:bg-slate-200/70 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white"
+              >
+                <ImagePlus className="h-5 w-5" aria-hidden="true" />
+              </button>
+            )}
+
             <button
               type="button"
-              onClick={openFilePicker}
+              onClick={onToggleImageMode}
               disabled={isGenerating || isProcessingImage}
-              aria-label="Upload image"
-              title="Upload image (JPG, PNG, WEBP)"
-              className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl text-slate-600 transition-colors hover:bg-slate-200/70 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white"
+              aria-pressed={imageMode}
+              aria-label={imageMode ? 'Switch to chat mode' : 'Generate AI image mode'}
+              title={imageMode ? 'Switch back to text chat' : 'Generate AI image from prompt'}
+              className={`flex h-11 shrink-0 items-center justify-center gap-1.5 rounded-xl px-3 text-xs font-medium whitespace-nowrap transition-colors disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 ${
+                imageMode
+                  ? 'bg-blue-600 text-white hover:bg-blue-700'
+                  : 'text-slate-600 hover:bg-slate-200/70 hover:text-slate-900 dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white'
+              }`}
             >
-              <ImagePlus className="h-5 w-5" aria-hidden="true" />
+              <Palette className="h-4 w-4 shrink-0" aria-hidden="true" />
+              <span className="hidden sm:inline">
+                {imageMode ? 'Image mode' : 'Create image'}
+              </span>
             </button>
 
             <label htmlFor="chat-message-input" className="sr-only">
-              Message SwiftChat
+              {imageMode ? 'Image generation prompt' : 'Message SwiftChat'}
             </label>
             <textarea
               ref={textareaRef}
@@ -207,11 +273,13 @@ export const ChatInput = memo(function ChatInput({
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
               placeholder={
-                pendingImage
-                  ? 'Ask a question about this image, or press Send...'
-                  : 'Ask anything or upload an image...'
+                imageMode
+                  ? 'Describe the AI image you want to generate...'
+                  : pendingImage
+                    ? 'Ask a question about this image, or press Send...'
+                    : 'Ask anything, upload an image, or type /imagine...'
               }
-              aria-label="Message input"
+              aria-label={imageMode ? 'Image generation prompt' : 'Message input'}
               className="max-h-40 min-h-[44px] flex-1 resize-none bg-transparent px-2 py-2.5 text-[15px] leading-snug text-slate-900 placeholder:text-slate-400 focus:outline-none dark:text-slate-100 dark:placeholder:text-slate-500"
             />
 
@@ -227,7 +295,7 @@ export const ChatInput = memo(function ChatInput({
               <button
                 type="submit"
                 disabled={!canSend}
-                aria-label="Send message"
+                aria-label={imageMode ? 'Generate image' : 'Send message'}
                 className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 dark:disabled:bg-slate-800 dark:disabled:text-slate-600"
               >
                 <ArrowUp className="h-5 w-5" aria-hidden="true" />
@@ -237,7 +305,9 @@ export const ChatInput = memo(function ChatInput({
         </form>
       </div>
       <p className="mx-auto mt-1.5 hidden max-w-3xl px-1 text-center text-xs text-slate-400 sm:block dark:text-slate-500">
-        Enter to send · Shift + Enter for new line · JPG, PNG, WEBP supported · Saved locally
+        {imageMode
+          ? 'Enter to generate · Output saved in chat & Local Storage gallery · Download anytime'
+          : 'Enter to send · Shift + Enter for new line · Type /imagine or click Create image for AI art'}
       </p>
     </div>
   );

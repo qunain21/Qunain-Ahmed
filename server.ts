@@ -2,8 +2,9 @@ import express, { Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { resolveGeminiApiKey } from './api/_env';
+import { resolveGeminiApiKey, resolveImageGenConfig } from './api/_env';
 import { handleChatRequest } from './api/_gemini';
+import { handleGenerateImageRequest } from './api/_imageGen';
 import { handleWeatherRequest } from './api/_weather';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -18,16 +19,28 @@ async function startServer() {
 
   app.get('/api/health', (_req: Request, res: Response) => {
     const { apiKey, source, vercelEnv } = resolveGeminiApiKey();
+    const imageGen = resolveImageGenConfig();
     res.json({
       ok: true,
       configured: Boolean(apiKey),
       source,
       environment: vercelEnv ?? (process.env.NODE_ENV || 'development'),
+      imageGeneration: {
+        providerId: imageGen.providerId,
+        providerLabel: imageGen.providerLabel,
+        hasKey: imageGen.hasKey,
+        source: imageGen.source,
+        freeTierNote: imageGen.freeTierNote,
+      },
     });
   });
 
   app.post('/api/chat', async (req: Request, res: Response) => {
     await handleChatRequest(req, res);
+  });
+
+  app.all('/api/generate-image', async (req: Request, res: Response) => {
+    await handleGenerateImageRequest(req, res);
   });
 
   app.all('/api/weather', async (req: Request, res: Response) => {
