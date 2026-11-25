@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { resolveGeminiApiKey } from './api/_env';
 import { handleChatRequest } from './api/_gemini';
 import { handleWeatherRequest } from './api/_weather';
 
@@ -16,13 +17,12 @@ async function startServer() {
   app.use(express.json({ limit: '6mb' }));
 
   app.get('/api/health', (_req: Request, res: Response) => {
+    const { apiKey, source, vercelEnv } = resolveGeminiApiKey();
     res.json({
       ok: true,
-      configured: Boolean(
-        process.env.GEMINI_API_KEY &&
-          process.env.GEMINI_API_KEY.trim() !== '' &&
-          process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY',
-      ),
+      configured: Boolean(apiKey),
+      source,
+      environment: vercelEnv ?? (process.env.NODE_ENV || 'development'),
     });
   });
 

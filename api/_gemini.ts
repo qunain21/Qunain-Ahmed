@@ -28,9 +28,10 @@ import {
   resolveDateTimeToolData,
   resolveDynamicDateTimeReply,
 } from './_weather.js';
+import { redactApiKeys, resolveGeminiApiKey } from './_env.js';
 
 // Skip synchronous filesystem .env reads when runtime secrets are already injected (e.g. Vercel)
-if (!process.env.VERCEL && !process.env.GEMINI_API_KEY) {
+if (!process.env.VERCEL && !resolveGeminiApiKey().apiKey) {
   dotenv.config({ path: '.env.local' });
   dotenv.config({ path: '.env' });
 }
@@ -41,7 +42,7 @@ const MAX_SERVER_RETRIES = 1;
 const MAX_AUTO_RETRY_DELAY_MS = 700;
 const UPSTREAM_CONNECT_TIMEOUT_MS = 18000;
 const STREAM_IDLE_TIMEOUT_MS = 18000;
-const MAX_BODY_BYTES = 6 * 1024 * 1024;
+const MAX_BODY_BYTES = process.env.VERCEL ? 4_200_000 : 6 * 1024 * 1024;
 
 interface IncomingImage {
   mimeType: string;
@@ -59,6 +60,7 @@ export interface ParsedApiError {
   code:
     | 'API_KEY_MISSING'
     | 'API_KEY_INVALID'
+    | 'API_KEY_PERMISSION_DENIED'
     | 'RATE_LIMITED_TEMPORARY'
     | 'DAILY_QUOTA_EXCEEDED'
     | 'INVALID_REQUEST'
@@ -164,7 +166,9 @@ function buildSystemInstruction(
     `CURRENT DATE & TIME: ${nowInfo.date}, ${nowInfo.time} (${tz}). ` +
     `Always use this live date/time (never outdated training dates) and never invent weather data.${weatherSection} ` +
     `Keep simple answers concise and direct.`;
-  const imageHint = hasImage ? ' Inspect the image carefully to answer.' : '';
+  const imageHint = hasImage
+    ? ' Inspect the image carefully and give a clear, helpful answer.'
+    : '';
   if (isUrduScript(latestText)) {
     return `${dateContext} Reply concisely in Urdu script.${imageHint}`;
   }
@@ -174,7 +178,8 @@ function buildSystemInstruction(
   return `${dateContext}${imageHint}`;
 }
 
-const DATA_URL_REGEX = /^data:(image\/(?:jpeg|jpg|png|webp));base64,([A-Za-z0-9+/=]+)$/;
+const DATA_URL_REGEX =
+  /^data:(image\/(?:jpeg|jpg|png|webp))(?:;[^,]+)*;base64,([A-Za-z0-9+/=\s]+)$/i;
 
 export function sendJson(res: ServerResponse, status: number, payload: unknown): void {
   res.statusCode = status;
@@ -228,13 +233,14 @@ function parseImagePart(image: unknown): Part | null {
   const candidate = image as { dataUrl?: unknown };
   if (typeof candidate.dataUrl !== 'string') return null;
 
-  const match = DATA_URL_REGEX.exec(candidate.dataUrl);
+  const match = DATA_URL_REGEX.exec(candidate.dataUrl.trim());
   if (!match) return null;
 
-  const mimeType = match[1] === 'image/jpg' ? 'image/jpeg' : match[1];
-  const base64Data = match[2];
+  const rawMime = match[1].toLowerCase();
+  const mimeType = rawMime === 'image/jpg' ? 'image/jpeg' : rawMime;
+  const base64Data = match[2].replace(/\s+/g, '');
 
-  if (base64Data.length > 5_500_000) {
+  if (!base64Data || base64Data.length > 4_000_000) {
     return null;
   }
 
@@ -248,13 +254,13 @@ function parseImagePart(image: unknown): Part | null {
 
 let cachedGeminiClient: { apiKey: string; client: GoogleGenAI } | null = null;
 
-function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+function getGeminiClient(): { client: GoogleGenAI; source: string | null; vercelEnv: string | null } {
+  const { apiKey, source, vercelEnv } = resolveGeminiApiKey();
+  if (!apiKey) {
     throw new Error('GEMINI_API_KEY_MISSING');
   }
   if (cachedGeminiClient && cachedGeminiClient.apiKey === apiKey) {
-    return cachedGeminiClient.client;
+    return { client: cachedGeminiClient.client, source, vercelEnv };
   }
   const client = new GoogleGenAI({
     apiKey,
@@ -265,7 +271,7 @@ function getGeminiClient(): GoogleGenAI {
     },
   });
   cachedGeminiClient = { apiKey, client };
-  return client;
+  return { client, source, vercelEnv };
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -326,11 +332,37 @@ function extractRpcErrorPayload(rawMessage: string): GoogleRpcErrorShape['error'
   const jsonStart = rawMessage.indexOf('{');
   if (jsonStart === -1) return null;
   try {
-    const parsed = JSON.parse(rawMessage.slice(jsonStart)) as GoogleRpcErrorShape;
-    return parsed?.error ?? null;
+    const parsed = JSON.parse(rawMessage.slice(jsonStart)) as GoogleRpcErrorShape &
+      GoogleRpcErrorShape['error'];
+    if (parsed?.error) return parsed.error;
+    if (typeof parsed?.code === 'number' || typeof parsed?.message === 'string') {
+      return parsed;
+    }
+    return null;
   } catch {
     return null;
   }
+}
+
+function getSafeErrorDiagnostics(
+  err: unknown,
+  parsed: ParsedApiError,
+  extra?: { keySource?: string | null; vercelEnv?: string | null },
+) {
+  const rawMessage = err instanceof Error ? err.message : String(err);
+  const errObj = err as { status?: number };
+  const rpcError = extractRpcErrorPayload(rawMessage);
+  const httpStatus = errObj?.status ?? rpcError?.code ?? null;
+  const rpcStatus = rpcError?.status ?? null;
+  const detail = redactApiKeys(rpcError?.message ?? rawMessage).slice(0, 300);
+  return {
+    code: parsed.code,
+    httpStatus,
+    rpcStatus,
+    keySource: extra?.keySource ?? null,
+    vercelEnv: extra?.vercelEnv ?? (process.env.VERCEL_ENV || null),
+    detail,
+  };
 }
 
 export function parseGeminiError(err: unknown): ParsedApiError {
@@ -339,7 +371,8 @@ export function parseGeminiError(err: unknown): ParsedApiError {
     return {
       status: 500,
       code: 'API_KEY_MISSING',
-      message: 'API configuration error. Please check your Gemini API key.',
+      message:
+        'API configuration error: Gemini API key is not configured on the server. Set GEMINI_API_KEY in Vercel Environment Variables and redeploy.',
       retryable: false,
     };
   }
@@ -385,19 +418,30 @@ export function parseGeminiError(err: unknown): ParsedApiError {
     }
   }
 
-  if (
+  const isInvalidKey =
     httpStatus === 401 ||
-    httpStatus === 403 ||
-    rpcStatus === 'PERMISSION_DENIED' ||
     rpcStatus === 'UNAUTHENTICATED' ||
     lower.includes('api_key_invalid') ||
     lower.includes('api key not valid') ||
-    lower.includes('api key expired')
-  ) {
+    lower.includes('api key expired') ||
+    lower.includes('invalid api key');
+
+  if (isInvalidKey) {
     return {
       status: 403,
       code: 'API_KEY_INVALID',
-      message: 'API configuration error. Please check your Gemini API key.',
+      message:
+        'API configuration error: The configured Gemini API key was rejected as invalid or expired. Verify GEMINI_API_KEY in your deployment settings and redeploy.',
+      retryable: false,
+    };
+  }
+
+  if (httpStatus === 403 || rpcStatus === 'PERMISSION_DENIED') {
+    return {
+      status: 403,
+      code: 'API_KEY_PERMISSION_DENIED',
+      message:
+        'API configuration error: Gemini API access was denied for this key. Remove HTTP referrer restrictions for server use and ensure the Generative Language API is enabled.',
       retryable: false,
     };
   }
@@ -535,7 +579,6 @@ async function streamWithOptionalTools(
   systemInstruction: string,
   signal: AbortSignal,
   includeToolsConfig: boolean,
-  maxOutputTokens = 768,
 ) {
   const thinkingLevel =
     model === 'gemini-3.1-flash-lite' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW;
@@ -558,8 +601,6 @@ async function streamWithOptionalTools(
       config: {
         abortSignal: timeoutController.signal,
         thinkingConfig: { thinkingLevel },
-        temperature: 0.6,
-        maxOutputTokens,
         systemInstruction,
         ...(includeToolsConfig
           ? { tools: [{ functionDeclarations: LIVE_TOOL_DECLARATIONS }] }
@@ -597,7 +638,6 @@ async function openStreamWithFirstChunk(
   signal: AbortSignal,
   enableTools: boolean,
   clientTimeZone?: string,
-  maxOutputTokens = 768,
 ) {
   if (!enableTools) {
     return await streamWithOptionalTools(
@@ -607,7 +647,6 @@ async function openStreamWithFirstChunk(
       systemInstruction,
       signal,
       false,
-      maxOutputTokens,
     );
   }
 
@@ -733,7 +772,6 @@ async function createStreamWithSmartRetry(
   signal: AbortSignal,
   enableTools: boolean,
   clientTimeZone?: string,
-  maxOutputTokens = 768,
 ) {
   let activeModel = PRIMARY_MODEL;
   let useTools = enableTools;
@@ -754,7 +792,6 @@ async function createStreamWithSmartRetry(
         signal,
         useTools,
         clientTimeZone,
-        maxOutputTokens,
       );
     } catch (err) {
       lastError = err;
@@ -900,6 +937,11 @@ export async function handleChatRequest(
       const hasValidImage = candidate.role === 'user' && parseImagePart(candidate.image) !== null;
       return hasText || hasValidImage;
     })
+    .map((m) => ({
+      role: m.role,
+      text: typeof m.text === 'string' ? m.text : '',
+      image: m.image,
+    }))
     .slice(-4);
 
   if (sanitized.length === 0 || sanitized[sanitized.length - 1].role !== 'user') {
@@ -1024,10 +1066,19 @@ export async function handleChatRequest(
   }
 
   let ai: GoogleGenAI;
+  let keySource: string | null = null;
+  let vercelEnv: string | null = null;
   try {
-    ai = getGeminiClient();
+    const resolved = getGeminiClient();
+    ai = resolved.client;
+    keySource = resolved.source;
+    vercelEnv = resolved.vercelEnv;
   } catch (err) {
     const parsed = parseGeminiError(err);
+    console.error(
+      '[api/chat error]',
+      getSafeErrorDiagnostics(err, parsed, { keySource, vercelEnv }),
+    );
     sendJson(res, parsed.status, {
       error: parsed.message,
       code: parsed.code,
@@ -1062,14 +1113,6 @@ export async function handleChatRequest(
 
   // Only invoke Gemini FunctionDeclaration round-trips when weather is needed and pre-grounding found no city
   const enableTools = weatherIntent && preGrounded.cityCount === 0;
-  const trimmedPrompt = latestMessage.text.trim();
-  const isDetailedRequest =
-    trimmedPrompt.length >= 120 ||
-    latestHasImage ||
-    /\b(code|function|typescript|javascript|python|react|essay|article|detailed|step\s+by\s+step|explain\s+in\s+detail|tutorial)\b/i.test(
-      trimmedPrompt,
-    );
-  const maxOutputTokens = isDetailedRequest ? 1152 : 512;
 
   try {
     const { iterator, firstText, model } = await createStreamWithSmartRetry(
@@ -1079,7 +1122,6 @@ export async function handleChatRequest(
       controller.signal,
       enableTools,
       clientTimeZone,
-      maxOutputTokens,
     );
 
     res.statusCode = 200;
@@ -1142,7 +1184,10 @@ export async function handleChatRequest(
     }
 
     const parsed = parseGeminiError(err);
-    console.error('[api/chat error]', parsed.code);
+    console.error(
+      '[api/chat error]',
+      getSafeErrorDiagnostics(err, parsed, { keySource, vercelEnv }),
+    );
     if (parsed.status === 429 && parsed.retryAfterSeconds) {
       res.setHeader('Retry-After', String(parsed.retryAfterSeconds));
     }

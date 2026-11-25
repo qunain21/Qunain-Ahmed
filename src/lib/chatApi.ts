@@ -139,28 +139,36 @@ export async function streamChatCompletion({
     const isHtmlResponse = contentType.includes('text/html');
 
     if (!response.ok) {
-      let errorMessage = 'Unable to connect to the AI service. Please try again.';
+      let errorMessage =
+        response.status === 413
+          ? 'The uploaded image is too large. Please choose a smaller image.'
+          : response.status === 401 || response.status === 403
+            ? 'API configuration error. Please check your Gemini API key.'
+            : 'Unable to connect to the AI service. Please try again.';
       let code =
         response.status === 404
           ? 'ENDPOINT_NOT_FOUND'
-          : isHtmlResponse
-            ? 'HTML_ERROR_RESPONSE'
-            : 'API_ERROR';
-      let retryable = response.status >= 500 || response.status === 429 || isHtmlResponse;
+          : response.status === 413
+            ? 'PAYLOAD_TOO_LARGE'
+            : isHtmlResponse
+              ? 'HTML_ERROR_RESPONSE'
+              : 'API_ERROR';
+      let retryable =
+        response.status >= 500 || response.status === 429 || isHtmlResponse;
       let retryAfterSeconds = parseRetryAfterHeader(response.headers.get('Retry-After'));
 
       if (isJsonResponse) {
         try {
           const payload = (await response.json()) as {
-            error?: string;
-            code?: string;
-            retryable?: boolean;
-            retryAfterSeconds?: number;
+            error?: unknown;
+            code?: unknown;
+            retryable?: unknown;
+            retryAfterSeconds?: unknown;
           };
-          if (payload.error) {
+          if (typeof payload.error === 'string' && payload.error.trim().length > 0) {
             errorMessage = payload.error;
           }
-          if (payload.code) {
+          if (typeof payload.code === 'string' && payload.code.trim().length > 0) {
             code = payload.code;
           }
           if (typeof payload.retryable === 'boolean') {
